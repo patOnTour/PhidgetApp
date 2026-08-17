@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phidget Konfiguration – Concretum</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root {
+            --concretum-dark: #212529;
+            --concretum-blue: #0056b3;
+            --concretum-accent: #ff6600;
+        }
+        body {
+            background-color: #f4f6f9;
+            color: #333333;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        .navbar {
+            background-color: var(--concretum-dark) !important;
+            border-bottom: 3px solid var(--concretum-accent);
+        }
+        .card {
+            border: none;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            margin-bottom: 1.5rem;
+        }
+        .card-header {
+            background-color: var(--concretum-dark);
+            color: white;
+            font-weight: 600;
+            border-top-left-radius: 8px !important;
+            border-top-right-radius: 8px !important;
+        }
+        .btn-primary {
+            background-color: var(--concretum-blue);
+            border-color: var(--concretum-blue);
+        }
+        .btn-primary:hover {
+            background-color: #004085;
+            border-color: #003875;
+        }
+        @media (max-width: 768px) {
+            .desktop-table { display: none; }
+            .mobile-sensor-card { display: block; }
+        }
+        @media (min-width: 769px) {
+            .desktop-table { display: table; }
+            .mobile-sensor-card { display: none; }
+        }
+        .sensor-item {
+            background: #ffffff;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <nav class="navbar navbar-dark mb-4">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0 h1 fw-bold">Concretum <span style="color: var(--concretum-accent);">Phidget Manager</span></span>
+            <a href="/logout" class="btn btn-outline-light btn-sm">Abmelden</a>
+        </div>
+    </nav>
+
+    <div class="container mb-5 px-3">
+        {% if msg %}
+            <div class="alert alert-{{ msg_type }} alert-dismissible fade show shadow-sm" role="alert">
+                {{ msg }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        {% endif %}
+
+        <div class="card shadow-sm mb-4">
+            <div class="card-body">
+                <h5 class="card-title fw-bold mb-3">Diagnose & Schnelltests</h5>
+                <div class="d-grid gap-2 d-md-flex flex-wrap">
+                    <form action="/test-notify" method="POST" class="flex-fill m-0">
+                        <button type="submit" class="btn btn-secondary w-100 py-2 fw-semibold">📲 Test Push (ntfy.sh)</button>
+                    </form>
+                    <form action="/test-thingsboard" method="POST" class="flex-fill m-0">
+                        <button type="submit" class="btn btn-warning w-100 py-2 fw-semibold">☁️ Test ThingsBoard</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <form action="/save" method="POST">
+            
+            <div class="card shadow-sm">
+                <div class="card-header">Allgemeine Einstellungen</div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="device_name" class="form-label fw-semibold">Gerätename (Client-ID)</label>
+                            <input type="text" class="form-control" id="device_name" name="device_name" value="{{ config.get('device_name', '') }}" required>
+                        </div>
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="systemd_service" class="form-label fw-semibold">Systemd Dienstname</label>
+                            <input type="text" class="form-control" id="systemd_service" name="systemd_service" value="{{ config.get('systemd_service', 'CCSsite01.service') }}" required>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-12 col-md-4 mb-3">
+                            <label for="phidget_serial" class="form-label fw-semibold">Hub Seriennummer</label>
+                            <input type="number" class="form-control" id="phidget_serial" name="phidget_serial" value="{{ config.get('phidget_serial', 0) }}" required>
+                        </div>
+                        <div class="col-12 col-md-4 mb-3">
+                            <label for="interval_minutes" class="form-label fw-semibold">Messintervall (Min)</label>
+                            <input type="number" class="form-control" id="interval_minutes" name="interval_minutes" value="{{ config.get('interval_minutes', 2) }}" required>
+                        </div>
+                        <div class="col-12 col-md-4 mb-3">
+                            <label for="notify_channel" class="form-label fw-semibold">ntfy.sh Channel (Geheim)</label>
+                            <input type="text" class="form-control" id="notify_channel" name="notify_channel" value="{{ config.get('notify', {}).get('channel_name', '') }}">
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="temp_delta_min" class="form-label fw-semibold">Temperatur Delta Min (°C)</label>
+                            <input type="number" step="0.1" class="form-control" id="temp_delta_min" name="temp_delta_min" value="{{ config.get('temp_delta_min', 0.6) }}">
+                        </div>
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="temp_delta_max" class="form-label fw-semibold">Temperatur Delta Max (°C)</label>
+                            <input type="number" step="0.1" class="form-control" id="temp_delta_max" name="temp_delta_max" value="{{ config.get('temp_delta_max', 1.0) }}">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm">
+                <div class="card-header bg-secondary">ThingsBoard MQTT Verbindung (Geheim)</div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-12 col-md-8 mb-3">
+                            <label for="tb_host" class="form-label fw-semibold">Host</label>
+                            <input type="text" class="form-control" id="tb_host" name="tb_host" value="{{ config.get('thingsboard', {}).get('host', 'mqtt.thingsboard.cloud') }}">
+                        </div>
+                        <div class="col-12 col-md-4 mb-3">
+                            <label for="tb_port" class="form-label fw-semibold">Port</label>
+                            <input type="number" class="form-control" id="tb_port" name="tb_port" value="{{ config.get('thingsboard', {}).get('port', 1883) }}">
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="tb_username" class="form-label fw-semibold">Access Token / Username</label>
+                            <input type="text" class="form-control" id="tb_username" name="tb_username" value="{{ config.get('thingsboard', {}).get('username', '') }}">
+                        </div>
+                        <div class="col-12 col-md-6 mb-3">
+                            <label for="tb_password" class="form-label fw-semibold">Passwort</label>
+                            <input type="password" class="form-control" id="tb_password" name="tb_password" value="{{ config.get('thingsboard', {}).get('password', '') }}">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- DEVICE-MAPPING -->
+            <div class="card shadow-sm">
+                <div class="card-header" style="background-color: #0056b3; color: white;">🏷️ Gerätenamen-Mapping (Device-Mapping)</div>
+                <div class="card-body">
+                    <p class="text-muted small">Lege fest, wie die technischen Geräte-IDs in den Benachrichtigungen im Klartext angezeigt werden sollen.</p>
+                    <div class="row">
+                        {% for key, val in device_mapping.items() %}
+                            <div class="col-12 col-md-6 mb-3">
+                                <label class="form-label fw-semibold text-secondary">Technische ID: <code>{{ key }}</code></label>
+                                <input type="text" class="form-control" name="dev_map_{{ key }}" value="{{ val }}" required>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+
+            <!-- KANAL-MAPPING -->
+            <div class="card shadow-sm">
+                <div class="card-header" style="background-color: #ff6600; color: white;">🎛️ Kanal-Benennungen für Benachrichtigungen</div>
+                <div class="card-body">
+                    <p class="text-muted small">Hier kannst du festlegen, wie die Kanäle in den ntfy-Push-Benachrichtigungen benannt werden sollen.</p>
+                    <div class="row">
+                        {% for key, val in mapping.items() %}
+                            <div class="col-12 col-md-6 mb-3">
+                                <label class="form-label fw-semibold text-secondary">Technischer Key: <code>{{ key }}</code></label>
+                                <input type="text" class="form-control" name="mapping_{{ key }}" value="{{ val }}" required>
+                            </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm">
+                <div class="card-header" style="background-color: #343a40;">Sensoren Manuell Zuweisen (VINT Hub Ports 0 - 5)</div>
+                <div class="card-body">
+                    
+                    <div class="table-responsive desktop-table">
+                        <table class="table table-bordered align-middle">
+                            <thead class="table-light">
+                                <tr>
+                                    <th style="width: 15%;">Port</th>
+                                    <th style="width: 45%;">Sensor Typ (Auswahl)</th>
+                                    <th style="width: 40%;">Telemetrie Key</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% set sensors = config.get('sensors', []) %}
+                                {% for i in range(6) %}
+                                    {% set s = sensors[i] if sensors|length > i else {'port': i, 'sensor_type': 'none', 'telemetry_key': 'Unbelegt'} %}
+                                <tr>
+                                    <td>
+                                        <strong>Port {{ i }}</strong>
+                                        <input type="hidden" name="port_{{ i }}" value="{{ i }}">
+                                    </td>
+                                    <td>
+                                        <select class="form-select" name="sensor_type_{{ i }}">
+                                            <option value="none" {% if s.sensor_type == 'none' %}selected{% endif %}>Unbelegt / Keiner</option>
+                                            <option value="tc_4port" {% if s.sensor_type == 'tc_4port' %}selected{% endif %}>Thermocouple 4-Port (TMP1101)</option>
+                                            <option value="humidity_temp" {% if s.sensor_type == 'humidity_temp' %}selected{% endif %}>Feuchte & Temperatur (HUM1001/HUM1100)</option>
+                                        </select>
+                                    </td>
+                                    <td>
+                                        <input type="text" class="form-control" name="telemetry_key_{{ i }}" value="{{ s.telemetry_key }}">
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="mobile-sensor-card">
+                        {% set sensors = config.get('sensors', []) %}
+                        {% for i in range(6) %}
+                            {% set s = sensors[i] if sensors|length > i else {'port': i, 'sensor_type': 'none', 'telemetry_key': 'Unbelegt'} %}
+                        <div class="sensor-item">
+                            <div class="fw-bold mb-2 text-primary">Port {{ i }}</div>
+                            <input type="hidden" name="port_{{ i }}" value="{{ i }}">
+                            
+                            <div class="mb-2">
+                                <label class="form-label small text-muted mb-1">Sensor Typ:</label>
+                                <select class="form-select form-select-sm" name="sensor_type_{{ i }}">
+                                    <option value="none" {% if s.sensor_type == 'none' %}selected{% endif %}>Unbelegt / Keiner</option>
+                                    <option value="tc_4port" {% if s.sensor_type == 'tc_4port' %}selected{% endif %}>Thermocouple 4-Port (TMP1101)</option>
+                                    <option value="humidity_temp" {% if s.sensor_type == 'humidity_temp' %}selected{% endif %}>Feuchte & Temperatur (HUM1001/HUM1100)</option>
+                                </select>
+                            </div>
+                            
+                            <div>
+                                <label class="form-label small text-muted mb-1">Telemetrie Key:</label>
+                                <input type="text" class="form-control form-control-sm" name="telemetry_key_{{ i }}" value="{{ s.telemetry_key }}">
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+
+                </div>
+            </div>
+
+            <div class="d-grid gap-2 mb-5">
+                <button type="submit" class="btn btn-success btn-lg py-3 fw-bold shadow">💾 Konfiguration speichern & Dienst neustarten</button>
+            </div>
+        </form>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

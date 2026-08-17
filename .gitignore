@@ -1,0 +1,9 @@
+config/*.json
+AppData/telemetry_buffer.db*
+AppData/data.db*
+AppData/logs/
+**/__pycache__/
+*.pyc
+project_export.txt
+Box1
+Box2

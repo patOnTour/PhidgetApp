@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kanal-Übersicht & Steuerung – Concretum</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .badge-triggered {
+            animation: blink 1.5s infinite;
+        }
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body class="bg-light">
+    <nav class="navbar navbar-dark bg-dark mb-4">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0 h1 fw-bold">Concretum <span style="color: #ff6600;">Mess-Steuerung</span></span>
+            <a href="/config" class="btn btn-outline-light btn-sm">⚙️ Zur System-Konfiguration</a>
+        </div>
+    </nav>
+
+    <div class="container mt-4 mb-5" style="max-width: 800px;">
+        
+        {% if msg %}
+            <div class="alert alert-{{ msg_type }} alert-dismissible fade show shadow-sm" role="alert">
+                {{ msg }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        {% endif %}
+
+        <div class="card shadow-sm mb-4 border-secondary">
+            <div class="card-body bg-white">
+                <h5 class="card-title fw-bold text-dark mb-3">🖥️ System-Informationen</h5>
+                <div class="row text-muted small">
+                    <div class="col-md-4 mb-2">
+                        <strong>Gerät:</strong> <span class="text-dark fw-semibold">{{ device_name_pretty }}</span> <code class="small">({{ device_id }})</code>
+                    </div>
+                    <div class="col-md-4 mb-2">
+                        <strong>IP-Adresse:</strong> <span class="text-dark fw-semibold">{{ local_ip }}</span>
+                    </div>
+                    <div class="col-md-4 mb-2">
+                        <strong>ntfy.sh Kanal:</strong> <span class="text-dark fw-semibold">{{ ntfy_channel }}</span>
+                    </div>
+                    <div class="col-12 mt-2">
+                        <strong>Web-GUI URL:</strong> <a href="{{ web_gui_url }}" target="_blank" class="fw-semibold text-primary">{{ web_gui_url }}</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3 class="mb-3 fw-bold">📡 Kanal-Übersicht & Steuerung</h3>
+        <p class="text-muted small mb-4">Hier siehst du alle Temperatur-Sensoren, deren aktuelle Messwerte und kannst Überwachungen starten oder zurücksetzen.</p>
+
+        {% for key, val in mapping.items() %}
+            {% if 'temp' in key.lower() %}
+                {% set ctrl = channel_controls.get(key, 'RESET') %}
+                <div class="card shadow mb-4 border-primary">
+                    <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                        <span class="fw-bold">⚡ {{ val }} <code class="text-light small">({{ key }})</code></span>
+                        <div>
+                            {% if ctrl == 'TRIGGERED' %}
+                                <span class="badge bg-danger text-white badge-triggered">🔴 ABBINDEBEGINN ERKANNT</span>
+                            {% elif ctrl == 'RUNN' %}
+                                <span class="badge bg-success text-white">🟢 ÜBERWACHUNG LÄUFT</span>
+                            {% else %}
+                                <span class="badge bg-secondary text-white">⚪ BEREIT / RESET</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div class="card-body bg-white">
+                        <div class="row align-items-center mb-3">
+                            <div class="col-md-6">
+                                <p class="mb-1 text-muted small">Aktueller Messwert:</p>
+                                <h3 class="fw-bold text-success mb-0">{{ channel_values.get(key, 'N/A') }}</h3>
+                            </div>
+                            <div class="col-md-6 text-md-end mt-2 mt-md-0">
+                                <span class="text-muted small">Status: <strong>{{ channel_statuses.get(key, '⚪ Bereit / Inaktiv') }}</strong></span>
+                            </div>
+                        </div>
+                        
+                        <hr>
+
+                        <form action="/control" method="POST">
+                            <input type="hidden" name="channel" value="{{ key }}">
+                            <div class="d-grid gap-2 d-md-flex justify-content-md-between">
+                                <button type="submit" name="action" value="runn" class="btn btn-success btn-sm fw-bold flex-fill py-2">
+                                    ▶️ RUNN (Start / Scharf)
+                                </button>
+                                <button type="submit" name="action" value="reset" class="btn btn-secondary btn-sm fw-bold flex-fill py-2">
+                                    🔄 RESET (Zurücksetzen)
+                                </button>
+                                <button type="submit" name="action" value="export" class="btn btn-warning btn-sm fw-bold flex-fill py-2">
+                                    ⏱️ EXPORT (Geplant)
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            {% endif %}
+        {% endfor %}
+
+        <div class="card shadow mt-5">
+            <div class="card-header bg-secondary text-white fw-bold">
+                🎛️ Sensor-Kanäle für Benachrichtigungen umbenennen
+            </div>
+            <div class="card-body">
+                <p class="text-muted small">Hier kann der Techniker direkt vor Ort die Kanalbezeichnungen anpassen, ohne ein Passwort eingeben zu müssen.</p>
+                
+                <form method="POST">
+                    {% for key, val in mapping.items() %}
+                        <div class="mb-3">
+                            <label class="form-label fw-semibold text-secondary">Technischer Key: <code>{{ key }}</code></label>
+                            <input type="text" class="form-control" name="{{ key }}" value="{{ val }}" required>
+                        </div>
+                    {% endfor %}
+                    <div class="d-grid gap-2">
+                        <button type="submit" class="btn btn-success fw-bold py-2">💾 Änderungen speichern</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

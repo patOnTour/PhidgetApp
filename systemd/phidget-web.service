@@ -1,0 +1,14 @@
+[Unit]
+Description=Phidget Web Management GUI
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/Web
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/Web/web_app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

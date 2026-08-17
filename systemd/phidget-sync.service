@@ -1,0 +1,15 @@
+[Unit]
+Description=Phidget Data Sync Service to Synology NAS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/sync_worker.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
