@@ -10,39 +10,96 @@ import logging
 from datetime import datetime, timezone
 import requests
 
-# AppData- und Projekt-Pfade für Modul-Imports sicherstellen
+#VERSION: 1.0.0
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 for p in [current_dir, parent_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# ConfigLoader initialisieren
-try:
-    from config_loader import ConfigLoader
-    cfg = ConfigLoader()
-    DEVICE_ID = cfg.device_name_technical
-except Exception as e:
-    cfg = None
-    DEVICE_ID = "ccssite01"
-    logging.warning(f"ConfigLoader konnte nicht geladen werden, Fallback auf '{DEVICE_ID}': {e}")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
+CONFIG_PATH = "/usr/userapps/PhidgetProject/config/config.json"
 DB_PATH = "/usr/userapps/PhidgetProject/AppData/telemetry_buffer.db"
 NAS_ENDPOINT = "https://telemetry.concretum-setting.com/api/v1/telemetry/ingest"
 API_TOKEN = "DeinGeheimerApiToken456!"
 BATCH_SIZE = 100
 SYNC_INTERVAL = 30
 
-CHANNEL_MAP = {
-    "ambient": 100,
-    "humidity": 101,
-    "display": 102
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+def build_dynamic_channel_map(config_file: str):
+    """
+    Liest config.json ein und mappt technische Spaltennamen dynamisch
+    auf fortlaufende Kanal-IDs (0..7, 100, 101).
+    """
+    channel_map = {}
+    device_name = "ccssite01"
+
+    if not os.path.exists(config_file):
+        logging.warning(f"Config-Datei {config_file} nicht gefunden. Nutze Fallback-Mapping.")
+        return {
+            "temp0": 0, "temp1": 1, "temp2": 2, "temp3": 3,
+            "temp4_0": 4, "temp4_1": 5, "temp4_2": 6, "temp4_3": 7,
+            "ambient": 100, "humidity": 101, "display": 102
+        }, device_name
+
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        device_name = data.get("device_name", "ccssite01")
+        tc_channel_counter = 0
+
+        for s in data.get("sensors", []):
+            stype = s.get("sensor_type", "").lower()
+            key = s.get("telemetry_key", "").strip()
+
+            if stype == "none" or not key or key.lower() == "unbelegt":
+                continue
+
+            # 4-Port Thermoelement Phidget (tc_4port)
+            if stype == "tc_4port":
+                for sub_ch in range(4):
+                    col_name = f"{key}{sub_ch}".lower()
+                    channel_map[col_name] = tc_channel_counter
+                    tc_channel_counter += 1
+
+            # Umgebungs-Sensor (humidity_temp)
+            elif stype == "humidity_temp":
+                channel_map["ambient"] = 100
+                channel_map["ambient_temp"] = 100
+                channel_map[f"{key.lower()}_temp"] = 100
+                channel_map[key.lower()] = 100
+
+                channel_map["humidity"] = 101
+                channel_map[f"{key.lower()}_humidity"] = 101
+
+            # Standard-Thermoelement Einzelkanal
+            elif "temp" in stype:
+                channel_map[key.lower()] = tc_channel_counter
+                tc_channel_counter += 1
+
+        channel_map.setdefault("ambient", 100)
+        channel_map.setdefault("humidity", 101)
+        channel_map.setdefault("display", 102)
+
+        logging.info(f"Dynamisches Channel-Mapping geladen: {channel_map}")
+        return channel_map, device_name
+
+    except Exception as e:
+        logging.error(f"Fehler beim Parsen der {config_file}: {e}")
+        return {}, device_name
+
+CHANNEL_MAP, DEVICE_ID = build_dynamic_channel_map(CONFIG_PATH)
+
+def resolve_channel_index(col_name: str) -> int:
+    col_lower = col_name.lower().strip()
+    if col_lower in CHANNEL_MAP:
+        return CHANNEL_MAP[col_lower]
+    return 200 + abs(hash(col_lower)) % 100
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
@@ -50,11 +107,9 @@ def get_db():
     return conn
 
 def init_db():
-    """Stellt Tabellen, dynamische Sensoren-Spalten und Indizes idempotent sicher."""
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     cursor = conn.cursor()
 
-    # 1. Basis-Tabelle anlegen, falls sie gar nicht existiert
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS telemetry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,35 +118,25 @@ def init_db():
         );
     """)
 
-    # 2. Bestehende Spalten auslesen
     cursor.execute("PRAGMA table_info(telemetry)")
     existing_cols = [col[1] for col in cursor.fetchall()]
 
-    # Erwartete Kanäle aus ConfigLoader oder Fallback (bis zu 8 Kanäle)
-    expected_channels = (
-        cfg.technical_channels if cfg else [f"Temp{i}" for i in range(8)] + ["ambient", "humidity"]
-    )
-
-    # Spalten einzeln prüfen und nur hinzufügen, wenn sie noch nicht existieren
-    for ch in expected_channels:
+    for ch in CHANNEL_MAP.keys():
         if ch not in existing_cols:
             try:
                 cursor.execute(f"ALTER TABLE telemetry ADD COLUMN {ch} REAL;")
-                logging.info(f"Spalte '{ch}' zur SQLite-Tabelle 'telemetry' hinzugefügt.")
-            except sqlite3.OperationalError as e:
-                logging.debug(f"Spalte {ch} konnte nicht hinzugefügt werden: {e}")
+                logging.info(f"Spalte '{ch}' zur SQLite-Tabelle 'telemetry' hinzugefuegt.")
+            except sqlite3.OperationalError:
+                pass
 
     if "synced" not in existing_cols:
         try:
             cursor.execute("ALTER TABLE telemetry ADD COLUMN synced INTEGER DEFAULT 0;")
-            logging.info("Spalte 'synced' zur Tabelle 'telemetry' hinzugefügt.")
         except sqlite3.OperationalError:
             pass
 
-    # 3. Index für schnellen Sync sicherstellen
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_synced_id ON telemetry(synced, id);")
 
-    # 4. Befehlstabelle sicherstellen
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_commands (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,26 +187,13 @@ def sync_batch():
         for col in value_cols:
             val = row[col]
             if val is not None:
-                col_lower = col.lower()
-                
-                # Thermocouple Kanäle dynamisch (Temp0 .. Temp7 etc.)
-                if col_lower.startswith("temp") and col_lower.replace("temp", "").isdigit():
-                    ch_idx = int(col_lower.replace("temp", ""))
-                elif col_lower in CHANNEL_MAP:
-                    ch_idx = CHANNEL_MAP[col_lower]
-                else:
-                    ch_idx = 200 + abs(hash(col_lower)) % 100
-
-                # Friendly Name aus ConfigLoader oder Fallback
-                friendly_name = (
-                    cfg.get_friendly_channel_name(col) if cfg else col
-                )
+                ch_idx = resolve_channel_index(col)
 
                 records_dict[(iso_ts, ch_idx)] = {
                     "timestamp": iso_ts,
                     "channel": ch_idx,
                     "temperature": float(val),
-                    "job_id": friendly_name
+                    "job_id": col
                 }
 
     records = list(records_dict.values())
@@ -195,7 +227,7 @@ def sync_batch():
                     """, (cmd.get("command"), json.dumps(cmd.get("payload", {}))))
 
             conn.commit()
-            logging.info(f"Sync erfolgreich ({DEVICE_ID}): {len(synced_ids)} Zeilen ({len(records)} Messpunkte) übertragen.")
+            logging.info(f"Sync erfolgreich ({DEVICE_ID}): {len(synced_ids)} Zeilen ({len(records)} Messpunkte) uebertragen.")
         else:
             logging.warning(f"NAS API meldet Fehler {res.status_code}: {res.text}")
 
@@ -205,7 +237,7 @@ def sync_batch():
         conn.close()
 
 if __name__ == "__main__":
-    logging.info(f"Phidget Telemetry Sync-Worker gestartet für Device: {DEVICE_ID}")
+    logging.info(f"Phidget Telemetry Sync-Worker gestartet fuer Device: {DEVICE_ID}")
     init_db()
     while True:
         try:
