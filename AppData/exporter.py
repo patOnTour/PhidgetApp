@@ -114,16 +114,21 @@ def execute_export(channel_name, db_path=None):
             except Exception:
                 pass
 
-    # 8. force_export-Flag in DB zurücksetzen
+    # 8. Kanal nach Export sauber auf RESET setzen
     try:
         conn = sqlite3.connect(analyzer.db_path)
         cursor = conn.cursor()
-        cursor.execute("UPDATE channel_control SET force_export = 0 WHERE LOWER(channel) = LOWER(?)", (channel_name,))
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute("""
+            UPDATE channel_control 
+            SET status = 'RESET', started_at = NULL, force_export = 0, updated_at = ? 
+            WHERE LOWER(channel) = LOWER(?)
+        """, (now_str, channel_name))
         conn.commit()
         conn.close()
-        logger.info(f"force_export Flag für {channel_name} in DB zurückgesetzt.")
+        logger.info(f"Kanal {channel_name} nach Export erfolgreich auf RESET gesetzt.")
     except Exception as e:
-        logger.error(f"Fehler beim Zurücksetzen des force_export Flags: {e}")
+        logger.error(f"Fehler beim Zurücksetzen des Kanalstatus: {e}")
 
     logger.info(f"Export für {friendly_name} abgeschlossen (Graph: {success_img}, CSV: {success_csv}).")
     return success_img and success_csv

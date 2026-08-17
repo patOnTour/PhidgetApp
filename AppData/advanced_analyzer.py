@@ -89,6 +89,53 @@ class ConcreteSettingAnalyzer:
             analyzer_logger.error(f"Fehler bei Export-Flag-Pruefung fuer {channel}: {e}")
         return False
 
+    def check_turnaround(self, channel_name, times, raw_temps, friendly_name, latest_time):
+        """
+        Erkennt zuverlässig das Durchschreiten der Talsohle (Auskühlung -> Erwärmung).
+        Bedingungen:
+        1. Mindestens 0.15 °C Abkühlung vom Start/Maximum der Phase bis zum Minimum.
+        2. Anschliessender Anstieg um mindestens +0.08 °C über diesen Tiefstwert.
+        """
+        ch_key = str(channel_name).lower()
+        if len(raw_temps) < 30 or self.turnaround_triggered.get(ch_key, False):
+            return
+
+        # 9-Punkte-Glättung gegen Rauschen
+        smooth = pd.Series(raw_temps).rolling(window=9, min_periods=3).mean()
+        
+        # Betrachte die Historie der letzten 45 Minuten (ca. 135 Punkte bei 20s)
+        window = smooth.iloc[-135:]
+        min_temp = window.min()
+        min_idx = window.idxmin()
+        current_temp = smooth.iloc[-1]
+        
+        pre_min_window = smooth.loc[:min_idx]
+        if len(pre_min_window) < 10:
+            return
+            
+        max_before_min = pre_min_window.iloc[-60:].max() if len(pre_min_window) >= 60 else pre_min_window.max()
+
+        cooling_delta = max_before_min - min_temp
+        reheating_delta = current_temp - min_temp
+
+        # Kriterium: Mindestens 0.15 °C abgekühlt UND nun 0.08 °C über Minimum
+        if cooling_delta >= 0.15 and reheating_delta >= 0.08:
+            if min_idx < (len(smooth) - 3):
+                self.turnaround_triggered[ch_key] = True
+                analyzer_logger.info(
+                    f"[TURNAROUND EVENT] {friendly_name} ({channel_name}): "
+                    f"Minimum bei {min_temp:.2f} °C durchschritten! "
+                    f"(Abkühlung: {cooling_delta:.2f} °C, Anstieg: +{reheating_delta:.2f} °C)"
+                )
+                try:
+                    notifier.send_turnaround_notification(
+                        channel=channel_name,
+                        temp=min_temp,
+                        timestamp=latest_time
+                    )
+                except Exception as ex:
+                    analyzer_logger.error(f"Fehler beim Senden der Turnaround-Push: {ex}")
+
     def evaluate_triggers(self, channel_name, df_history):
         friendly_name = self.cfg.get_friendly_channel_name(channel_name)
         ch_key = str(channel_name).lower()
@@ -127,39 +174,8 @@ class ConcreteSettingAnalyzer:
         latest_slope = 0.0
         latest_rotation = 0.0
 
-        # --- 1. Minimum-Turnaround-Erkennung (9-Punkte-Gleitmittelwert) ---
-        if len(raw_temps) >= 20 and not self.turnaround_triggered.get(ch_key, False):
-            try:
-                # 9-Punkte-Mittelwertbildung
-                smooth_9 = raw_temps.rolling(window=9, min_periods=5).mean()
-                
-                # Zeitabstand der Punkte ermitteln (Standard 20s)
-                dt_s = 20.0
-                if len(times) >= 2:
-                    t_last = times.iloc[-1] if isinstance(times.iloc[-1], (int, float)) else pd.to_datetime(times.iloc[-1]).timestamp()
-                    t_prev = times.iloc[-2] if isinstance(times.iloc[-2], (int, float)) else pd.to_datetime(times.iloc[-2]).timestamp()
-                    diff_val = t_last - t_prev
-                    if diff_val > 0:
-                        dt_s = diff_val
-
-                # Steigung über die letzten Punkte
-                slope_recent = (smooth_9.iloc[-1] - smooth_9.iloc[-4]) / (3 * dt_s)
-                
-                # Vorherige Steigung prüfen (Historie von 10-25 Punkten davor)
-                hist_start = max(0, len(smooth_9) - 25)
-                hist_end = max(1, len(smooth_9) - 8)
-                slope_history = (smooth_9.iloc[hist_end] - smooth_9.iloc[hist_start]) / ((hist_end - hist_start) * dt_s)
-
-                # Bedingung: Zuvor abgekühlt (< -0.0002 °C/s) und nun ansteigend (> +0.0002 °C/s)
-                if slope_history <= -0.0002 and slope_recent >= 0.0002:
-                    self.turnaround_triggered[ch_key] = True
-                    analyzer_logger.info(f"[TURNAROUND EVENT] {friendly_name} ({channel_name}): Minimum erreicht! Erwaermung startet bei {latest_temp:.2f} Grad C ({latest_time})")
-                    try:
-                        notifier.send_turnaround_notification(channel=channel_name, temp=latest_temp, timestamp=latest_time)
-                    except Exception as ex_not:
-                        analyzer_logger.error(f"Fehler beim Senden der Turnaround-Push: {ex_not}")
-            except Exception as e:
-                analyzer_logger.error(f"Fehler bei Turnaround-Berechnung fuer {channel_name}: {e}")
+        # --- 1. Minimum-Turnaround-Erkennung ---
+        self.check_turnaround(channel_name, times, raw_temps, friendly_name, latest_time)
 
         # --- 2. Rotations-Trigger (0.000002) ---
         try:

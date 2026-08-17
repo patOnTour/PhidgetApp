@@ -99,20 +99,21 @@ class AnalyzerService:
                 success = self.run_exporter(ch, export_type="AUTOMATIC_30MIN")
 
                 if success:
+                    # 1. setting_state aktualisieren
                     cursor.execute("""
                         UPDATE setting_state 
                         SET export_status = 'COMPLETED', exported_at = ? 
                         WHERE LOWER(channel) = ?
                     """, (datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'), ch.lower()))
-                    logger.info(f"[Auto Export Scheduler] Export fuer Kanal {ch} erfolgreich abgeschlossen.")
-                else:
-                    new_status = 'PENDING' if (attempts + 1) < 3 else 'FAILED'
+                    
+                    # 2. Kanal vollständig auf RESET setzen (Status zurücksetzen & started_at leeren)
                     cursor.execute("""
-                        UPDATE setting_state 
-                        SET export_status = ?, export_error = 'Exporter subprocess failed' 
+                        UPDATE channel_control 
+                        SET status = 'RESET', started_at = NULL, force_export = 0, updated_at = ? 
                         WHERE LOWER(channel) = ?
-                    """, (new_status, ch.lower()))
-                    logger.error(f"[Auto Export Scheduler] Export fuer Kanal {ch} fehlgeschlagen. Neuer Status: {new_status}")
+                    """, (datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'), ch.lower()))
+                    
+                    logger.info(f"[Auto Export Scheduler] Export fuer Kanal {ch} erfolgreich abgeschlossen und Kanal auf RESET gesetzt.")
                 
                 conn.commit()
 
