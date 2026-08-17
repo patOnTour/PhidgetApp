@@ -10,15 +10,22 @@ import logging
 from datetime import datetime, timezone
 import requests
 
-#VERSION: 1.0.0
-
+# Pfade für lokale Imports einrichten
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 for p in [current_dir, parent_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-CONFIG_PATH = "/usr/userapps/PhidgetProject/config/config.json"
+from config_loader import ConfigLoader
+
+# VERSION: 2.0.0
+
+# 1. Konfiguration zentral laden
+cfg = ConfigLoader()
+DEVICE_ID = cfg.device_name_technical
+CHANNEL_MAP = cfg.get_channel_id_map()
+
 DB_PATH = "/usr/userapps/PhidgetProject/AppData/telemetry_buffer.db"
 NAS_ENDPOINT = "https://telemetry.concretum-setting.com/api/v1/telemetry/ingest"
 API_TOKEN = "DeinGeheimerApiToken456!"
@@ -29,71 +36,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-
-def build_dynamic_channel_map(config_file: str):
-    """
-    Liest config.json ein und mappt technische Spaltennamen dynamisch
-    auf fortlaufende Kanal-IDs (0..7, 100, 101).
-    """
-    channel_map = {}
-    device_name = "ccssite01"
-
-    if not os.path.exists(config_file):
-        logging.warning(f"Config-Datei {config_file} nicht gefunden. Nutze Fallback-Mapping.")
-        return {
-            "temp0": 0, "temp1": 1, "temp2": 2, "temp3": 3,
-            "temp4_0": 4, "temp4_1": 5, "temp4_2": 6, "temp4_3": 7,
-            "ambient": 100, "humidity": 101, "display": 102
-        }, device_name
-
-    try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        device_name = data.get("device_name", "ccssite01")
-        tc_channel_counter = 0
-
-        for s in data.get("sensors", []):
-            stype = s.get("sensor_type", "").lower()
-            key = s.get("telemetry_key", "").strip()
-
-            if stype == "none" or not key or key.lower() == "unbelegt":
-                continue
-
-            # 4-Port Thermoelement Phidget (tc_4port)
-            if stype == "tc_4port":
-                for sub_ch in range(4):
-                    col_name = f"{key}{sub_ch}".lower()
-                    channel_map[col_name] = tc_channel_counter
-                    tc_channel_counter += 1
-
-            # Umgebungs-Sensor (humidity_temp)
-            elif stype == "humidity_temp":
-                channel_map["ambient"] = 100
-                channel_map["ambient_temp"] = 100
-                channel_map[f"{key.lower()}_temp"] = 100
-                channel_map[key.lower()] = 100
-
-                channel_map["humidity"] = 101
-                channel_map[f"{key.lower()}_humidity"] = 101
-
-            # Standard-Thermoelement Einzelkanal
-            elif "temp" in stype:
-                channel_map[key.lower()] = tc_channel_counter
-                tc_channel_counter += 1
-
-        channel_map.setdefault("ambient", 100)
-        channel_map.setdefault("humidity", 101)
-        channel_map.setdefault("display", 102)
-
-        logging.info(f"Dynamisches Channel-Mapping geladen: {channel_map}")
-        return channel_map, device_name
-
-    except Exception as e:
-        logging.error(f"Fehler beim Parsen der {config_file}: {e}")
-        return {}, device_name
-
-CHANNEL_MAP, DEVICE_ID = build_dynamic_channel_map(CONFIG_PATH)
 
 def resolve_channel_index(col_name: str) -> int:
     col_lower = col_name.lower().strip()
@@ -119,7 +61,7 @@ def init_db():
     """)
 
     cursor.execute("PRAGMA table_info(telemetry)")
-    existing_cols = [col[1] for col in cursor.fetchall()]
+    existing_cols = [col[1].lower() for col in cursor.fetchall()]
 
     for ch in CHANNEL_MAP.keys():
         if ch not in existing_cols:
@@ -155,7 +97,7 @@ def sync_batch():
     cursor = conn.cursor()
 
     cursor.execute("PRAGMA table_info(telemetry)")
-    cols = [col["name"] for col in cursor.fetchall()]
+    cols = [col["name"].lower() for col in cursor.fetchall()]
     value_cols = [c for c in cols if c not in ("id", "timestamp", "synced")]
 
     cursor.execute(f"""

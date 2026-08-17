@@ -32,7 +32,7 @@ class TelemetryDB:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            # 1. Tabellen mit Basisschema anlegen
+            # 1. Setting State Tabelle
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS setting_state (
                     channel TEXT PRIMARY KEY,
@@ -49,6 +49,7 @@ class TelemetryDB:
                 )
             ''')
 
+            # 2. Channel Control Tabelle
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS channel_control (
                     channel TEXT PRIMARY KEY,
@@ -59,60 +60,48 @@ class TelemetryDB:
                 )
             ''')
 
+            # 3. Telemetry Queue
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS telemetry_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp REAL,
-                    payload TEXT
+                    payload TEXT,
+                    retry_count INTEGER DEFAULT 0
                 )
             ''')
 
+            # 4. System Commands
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS telemetry (
+                CREATE TABLE IF NOT EXISTS system_commands (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL,
-                    ambient REAL,
-                    humidity REAL
+                    received_at TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    payload TEXT,
+                    executed INTEGER DEFAULT 0
                 )
             ''')
 
-            conn.commit()
+            # 5. Telemetrie-Tabelle direkt mit allen dynamischen Spalten erstellen
+            all_cols = ["id INTEGER PRIMARY KEY AUTOINCREMENT", "timestamp REAL NOT NULL", "synced INTEGER DEFAULT 0"]
+            for col in self.cfg.technical_channels:
+                col_clean = col.lower().strip()
+                if col_clean not in ["id", "timestamp", "synced"]:
+                    all_cols.append(f"{col_clean} REAL")
+            
+            cols_def = ", ".join(all_cols)
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS telemetry ({cols_def})")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_synced_id ON telemetry(synced, id);")
 
-            # 2. Spaltenmigration für setting_state durchführen
-            cursor.execute("PRAGMA table_info(setting_state)")
-            existing_ss_cols = [row[1].lower() for row in cursor.fetchall()]
-
-            ss_migrations = {
-                "export_status": "TEXT DEFAULT 'PENDING'",
-                "exported_at": "TEXT",
-                "export_attempts": "INTEGER DEFAULT 0",
-                "export_error": "TEXT"
-            }
-
-            for col_name, col_type in ss_migrations.items():
-                if col_name.lower() not in existing_ss_cols:
-                    cursor.execute(f"ALTER TABLE setting_state ADD COLUMN {col_name} {col_type}")
-                    logger.info(f"[DB Migration] Spalte '{col_name}' zu 'setting_state' hinzugefügt.")
-
-            # --- HIER: Migration für telemetry_queue ---
-            cursor.execute("PRAGMA table_info(telemetry_queue)")
-            existing_tq_cols = [row[1].lower() for row in cursor.fetchall()]
-            if "retry_count" not in existing_tq_cols:
-                cursor.execute("ALTER TABLE telemetry_queue ADD COLUMN retry_count INTEGER DEFAULT 0")
-                logger.info("[DB Migration] Spalte 'retry_count' zu 'telemetry_queue' hinzugefügt.")
-            # -------------------------------------------
-
-            # 3. Dynamische Spaltenmigration für telemetry ausführen (z. B. Temp0..Temp7)
+            # 6. Fehlende Spalten prüfen falls Tabelle schon existierte
             cursor.execute("PRAGMA table_info(telemetry)")
             existing_telem_cols = [row[1].lower() for row in cursor.fetchall()]
 
             for ch_key in self.cfg.technical_channels:
-                ch_clean = ch_key.lower()
+                ch_clean = ch_key.lower().strip()
                 if ch_clean not in existing_telem_cols:
                     cursor.execute(f"ALTER TABLE telemetry ADD COLUMN {ch_clean} REAL")
-                    logger.info(f"[DB Migration] Dynamische Spalte '{ch_clean}' zu 'telemetry' hinzugefügt.")
 
-            # 4. Kanäle in channel_control & setting_state vorinitialisieren
+            # 7. Kanäle in channel_control & setting_state vorinitialisieren
             now_iso = datetime.now().isoformat()
             for ch_key in self.cfg.get_temperature_channels():
                 cursor.execute(
@@ -126,6 +115,7 @@ class TelemetryDB:
 
             conn.commit()
             conn.close()
+            logger.info("Datenbank-Initialisierung erfolgreich abgeschlossen.")
         except Exception as e:
             logger.error(f"Fehler bei DB-Initialisierung: {e}")
 

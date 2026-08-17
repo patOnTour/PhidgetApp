@@ -62,7 +62,7 @@ class PhidgetReader:
                         self.active_sensors.append(temp_sensor)
                         
                         tc_idx = len([s for s in self.sensor_map if s[1] == "tc"])
-                        key = f"{t_key}{tc_idx}" if t_key else f"Temp{tc_idx}"
+                        key = f"temp{tc_idx}"
                         self.sensor_map.append((temp_sensor, "tc", key))
                     except Exception as ex:
                         logger.error(f"Fehler beim Initialisieren Thermo-Sensor Port {port} Kanal {channel}: {ex}")
