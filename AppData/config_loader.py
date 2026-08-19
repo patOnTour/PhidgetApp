@@ -5,7 +5,7 @@ import os
 import json
 
 class ConfigLoader:
-    VERSION = "2.0.0"
+    VERSION = "1.2.0"
         
     def __init__(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,79 +21,72 @@ class ConfigLoader:
         self.channel_mapping = self._load_json(self.channel_mapping_path)
         self.device_mapping = self._load_json(self.device_mapping_path)
 
+        # --- 1. DEVICE VARIABLEN ---
         self.device_name_technical = self.main_config.get("device_name", "ccssite01")
         self.device_name_friendly = self.device_mapping.get(self.device_name_technical, self.device_name_technical)
 
+        # --- 2. PHIDGET & SYSTEM VARIABLEN ---
         self.phidget_serial = self.main_config.get("phidget_serial")
         self.interval_minutes = self.main_config.get("interval_minutes", 2)
         self.temp_delta_min = self.main_config.get("temp_delta_min", 0.6)
         self.temp_delta_max = self.main_config.get("temp_delta_max", 1.0)
 
-        # MQTT / Thingsboard
+        # --- 3. MQTT / THINGSBOARD LOGIN DATEN ---
         tb_cfg = self.secrets.get("thingsboard", {})
         self.mqtt_host = tb_cfg.get("host")
         self.mqtt_port = tb_cfg.get("port")
         self.mqtt_username = tb_cfg.get("username")
         self.mqtt_password = tb_cfg.get("password")
 
-        # NTFY
+        # --- 4. NTFY CHANNELS ---
         notify_cfg = self.secrets.get("notify", {})
         self.ntfy_channel = notify_cfg.get("channel_name")
+        
         admin_notify_cfg = self.secrets.get("admin_notify", {})
         self.admin_ntfy_channel = admin_notify_cfg.get("channel_name", self.ntfy_channel)
 
-        # --- DETERMINISTISCHE KANAL-GENERIERUNG ---
+        # --- 5. TECHNISCHE KANALNAMEN & DYNAMISCHE PORT-ERKENNUNG ---
         self.technical_channels = []
         self.temperature_channels = []
-        self.channel_to_id_map = {}
         
-        tc_idx = 0
+        tc_channel_counter = 0
 
         for sensor in self.main_config.get("sensors", []):
-            stype = sensor.get("sensor_type", "").lower()
-            if stype == "none" or stype == "unbelegt":
-                continue
+            stype = sensor.get("sensor_type")
+            t_key = sensor.get("telemetry_key", "Temp")
 
             if stype == "tc_4port":
-                ch_count = sensor.get("channels_count", 4)
-                for _ in range(ch_count):
-                    key = f"temp{tc_idx}"
-                    self.technical_channels.append(key)
-                    self.temperature_channels.append(key)
-                    self.channel_to_id_map[key] = tc_idx
-                    tc_idx += 1
-
+                channels_per_module = sensor.get("channels_count", 4)
+                for _ in range(channels_per_module):
+                    col_name = f"{t_key}{tc_channel_counter}"
+                    if col_name not in self.technical_channels:
+                        self.technical_channels.append(col_name)
+                        self.temperature_channels.append(col_name)
+                    tc_channel_counter += 1
+                        
             elif stype == "humidity_temp":
                 if "ambient" not in self.technical_channels:
                     self.technical_channels.append("ambient")
-                    self.channel_to_id_map["ambient"] = 100
                 if "humidity" not in self.technical_channels:
                     self.technical_channels.append("humidity")
-                    self.channel_to_id_map["humidity"] = 101
+            elif t_key and t_key != "Unbelegt" and t_key not in self.technical_channels:
+                self.technical_channels.append(t_key)
+                if t_key.lower().startswith("temp"):
+                    self.temperature_channels.append(t_key)
 
-            elif "temp" in stype:
-                key = f"temp{tc_idx}"
-                self.technical_channels.append(key)
-                self.temperature_channels.append(key)
-                self.channel_to_id_map[key] = tc_idx
-                tc_idx += 1
-
-        # Fallback falls keine TC-Sensoren definiert sind
+        # Fallback falls keine Thermocouple-Sensoren definiert sind
         if not self.temperature_channels:
-            for i in range(4):
-                key = f"temp{i}"
-                self.technical_channels.append(key)
-                self.temperature_channels.append(key)
-                self.channel_to_id_map[key] = i
+            self.temperature_channels = ["Temp0", "Temp1", "Temp2", "Temp3"]
+            for ch in self.temperature_channels:
+                if ch not in self.technical_channels:
+                    self.technical_channels.append(ch)
 
         if "ambient" not in self.technical_channels:
             self.technical_channels.append("ambient")
-            self.channel_to_id_map["ambient"] = 100
         if "humidity" not in self.technical_channels:
             self.technical_channels.append("humidity")
-            self.channel_to_id_map["humidity"] = 101
 
-        # Friendly Names Mapping
+        # Mapping für Friendly Names
         self.channel_names_mapping = {}
         for tech_key in self.technical_channels:
             self.channel_names_mapping[tech_key] = self.channel_mapping.get(tech_key, tech_key)
@@ -108,10 +101,8 @@ class ConfigLoader:
         return {}
 
     def get_friendly_channel_name(self, technical_key):
-        return self.channel_names_mapping.get(technical_key.lower(), technical_key)
+        return self.channel_names_mapping.get(technical_key, technical_key)
 
     def get_temperature_channels(self):
-        return list(self.temperature_channels)
-
-    def get_channel_id_map(self):
-        return dict(self.channel_to_id_map)
+        """Liefert dynamisch alle reinen Temperatur-Messkanäle (z.B. Temp0..Temp3 oder Temp0..Temp7)."""
+        return sorted(self.temperature_channels)

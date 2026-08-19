@@ -5,7 +5,7 @@
 Modul: analyzer_service.py
 Beschreibung: Dedizierter Dienst fuer Regressionsberechnung, Triggerevaluierung, 
               WebGUI-Status-Synchronisation und automatischen 30-Minuten-Export.
-Version: 2.0.0 (Volle advanced_analyzer Integration + P0/P1 Fixes)
+Version: 2.1.0 (6h-Fallback Support, P0/P1 Fixes & Server-konforme Notifications)
 """
 
 import time
@@ -38,7 +38,7 @@ logger = logging.getLogger("AnalyzerService")
 
 
 class AnalyzerService:
-    VERSION = "2.0.0"
+    VERSION = "2.1.0"
 
     def __init__(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -65,7 +65,7 @@ class AnalyzerService:
                 logger.error(f"Fehler bei manueller Export-Pruefung fuer {channel}: {e}")
 
     def check_scheduled_exports(self):
-        """2. P0 FIX: Prueft faellige 30-Minuten Auto-Exporte und fuehrt exporter.py aus."""
+        """2. Prueft faellige 30-Minuten Auto-Exporte und fuehrt exporter.py aus."""
         try:
             conn = self._get_db_connection()
             cursor = conn.cursor()
@@ -99,21 +99,29 @@ class AnalyzerService:
                 success = self.run_exporter(ch, export_type="AUTOMATIC_30MIN")
 
                 if success:
-                    # 1. setting_state aktualisieren
+                    # 1. setting_state aktualisieren (trigger_fired = 2 fuer abgeschlossen)
                     cursor.execute("""
                         UPDATE setting_state 
-                        SET export_status = 'COMPLETED', exported_at = ? 
+                        SET export_status = 'FINISHED', 
+                            trigger_fired = 2, 
+                            exported_at = ? 
                         WHERE LOWER(channel) = ?
                     """, (datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'), ch.lower()))
                     
-                    # 2. Kanal vollständig auf RESET setzen (Status zurücksetzen & started_at leeren)
+                    # 2. Kanal vollstaendig auf STOPPED setzen
                     cursor.execute("""
                         UPDATE channel_control 
-                        SET status = 'RESET', started_at = NULL, force_export = 0, updated_at = ? 
+                        SET status = 'STOPPED', started_at = NULL, force_export = 0, updated_at = ? 
                         WHERE LOWER(channel) = ?
                     """, (datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'), ch.lower()))
                     
-                    logger.info(f"[Auto Export Scheduler] Export fuer Kanal {ch} erfolgreich abgeschlossen und Kanal auf RESET gesetzt.")
+                    logger.info(f"[Auto Export Scheduler] Export fuer Kanal {ch} erfolgreich abgeschlossen und Kanal auf STOPPED gesetzt.")
+                else:
+                    cursor.execute("""
+                        UPDATE setting_state 
+                        SET export_status = 'PENDING' 
+                        WHERE LOWER(channel) = ?
+                    """, (ch.lower(),))
                 
                 conn.commit()
 
@@ -149,27 +157,42 @@ class AnalyzerService:
             if status not in ["RUNN", "RUNNING"]:
                 return
 
+            conn_start = self._get_db_connection()
+            cursor_start = conn_start.cursor()
+            cursor_start.execute("SELECT started_at FROM channel_control WHERE LOWER(channel) = LOWER(?)", (channel,))
+            row_start = cursor_start.fetchone()
+            started_at_str = row_start[0] if row_start and row_start[0] else None
+            
+            cursor_start.execute("SELECT trigger_fired FROM setting_state WHERE LOWER(channel) = LOWER(?)", (channel,))
+            row_trig = cursor_start.fetchone()
+            conn_start.close()
+
+            already_fired = row_trig[0] if row_trig else 0
+            if already_fired != 0:
+                return
+
+            # Startzeit in Sekunden ermitteln fuer den 6h-Fallback
+            start_time_sec = None
+            if started_at_str:
+                try:
+                    clean_str = str(started_at_str).replace('T', ' ')[:19]
+                    dt_start = datetime.strptime(clean_str, '%Y-%m-%d %H:%M:%S')
+                    start_time_sec = dt_start.timestamp()
+                except Exception:
+                    start_time_sec = None
+
             times_sec, temps, ambs, parsed_times = self.analyzer.load_data_from_db(channel)
             if temps is None or len(temps) < 6:
                 return
 
             df_history = pd.DataFrame({'Timestamp': parsed_times, channel: temps})
-            
-            conn_tmp = self._get_db_connection()
-            cursor = conn_tmp.cursor()
-            cursor.execute("SELECT trigger_fired FROM setting_state WHERE LOWER(channel) = LOWER(?)", (channel,))
-            row_trig = cursor.fetchone()
-            conn_tmp.close()
-            
-            already_fired = row_trig[0] if row_trig else 0
-            if already_fired == 1:
-                return
 
             # Vollstaendige Triggerevaluierung aus advanced_analyzer
-            trigger_type, t_ab, temp_ab, rot_val, slope_val = self.analyzer.evaluate_triggers(channel, df_history)
+            trigger_type, t_ab, temp_ab, rot_val, slope_val = self.analyzer.evaluate_triggers(
+                channel, df_history, start_time_sec=start_time_sec
+            )
             
             if trigger_type:
-                # P1 FIX: Keine -2h Manipulation mehr! Wir nutzen die korrekte lokale Systemzeit
                 now_dt = datetime.now().astimezone()
                 target_dt = now_dt + timedelta(minutes=30)
                 
@@ -179,7 +202,7 @@ class AnalyzerService:
 
                 logger.info(f"🔥 [TRIGGER ERKANNT] Kanal {channel}! Typ: {trigger_type}, Abbindebeginn: {t_ab_str}, Temp: {temp_ab:.1f}°C.")
 
-                # P0 FIX: Atomare Aktualisierung von setting_state UND channel_control (WebGUI Sync)!
+                # Atomare Aktualisierung von setting_state UND channel_control
                 conn = self._get_db_connection()
                 cursor = conn.cursor()
                 
@@ -203,12 +226,12 @@ class AnalyzerService:
                 conn.commit()
                 conn.close()
 
-                # Alarmierung senden
-                friendly_name = self.analyzer.cfg.get_friendly_channel_name(channel)
-                notifier.send_push_notification(
-                    title=f"Beton-Alarm: {friendly_name}!",
-                    message=f"Abbindebeginn um {t_ab_str} erreicht ({trigger_type}). Temp: {temp_ab:.1f} Grad C",
-                    tags="fire"
+                # Alarmierung via Notifier an ntfy senden
+                notifier.send_setting_alarm_notification(
+                    channel=channel,
+                    trigger_type=trigger_type,
+                    t_ab_str=t_ab_str,
+                    temp_ab=temp_ab
                 )
 
         except Exception as e:
@@ -221,7 +244,6 @@ class AnalyzerService:
             try:
                 time.sleep(10)
                 
-                # Dynamische Kanalerkennung nutzen
                 self.analyzer.cfg = ConfigLoader()
                 channels = self.analyzer.cfg.get_temperature_channels()
 

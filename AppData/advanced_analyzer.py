@@ -28,7 +28,7 @@ if not analyzer_logger.handlers:
     analyzer_logger.addHandler(handler)
 
 class ConcreteSettingAnalyzer:
-    VERSION = "5.3.0"  # Rotation 0.000002 & 9-Punkte-Minimum-Turnaround-Erkennung
+    VERSION = "5.4.0"  # 10min-Sink/3min-Steig Wendepunkt & 6h-Tangenten-Fallback
 
     def __init__(self, db_path=None, ema_span=30, reg_window=15):
         self.cfg = ConfigLoader()
@@ -36,7 +36,8 @@ class ConcreteSettingAnalyzer:
         self.ema_span = ema_span     # 30 Messpunkte = 10 Min bei 20s Takt
         self.reg_window = reg_window # 15 Messpunkte = 5 Min bei 20s Takt
         self.version = self.VERSION
-        self.turnaround_triggered = {}  # Merker pro Kanal
+        self.turnaround_armed = {}      # Merker: 10 Min Absinken erkannt
+        self.turnaround_triggered = {}  # Merker: Wendepunkt bereits gefeuert
         self._init_analysis_db()
 
     def _init_analysis_db(self):
@@ -89,43 +90,83 @@ class ConcreteSettingAnalyzer:
             analyzer_logger.error(f"Fehler bei Export-Flag-Pruefung fuer {channel}: {e}")
         return False
 
+    def get_manual_export_window(self, times_sec, temps, ambs, parsed_times, minutes=120):
+        """Schneidet die Daten auf das gewuenschte Zeitfenster (Standard: 120 Minuten) zu."""
+        if times_sec is None or len(times_sec) == 0:
+            return times_sec, temps, ambs, parsed_times
+
+        cutoff_sec = times_sec[-1] - (minutes * 60)
+        idx_start = np.searchsorted(times_sec, cutoff_sec)
+
+        return (
+            times_sec[idx_start:],
+            temps[idx_start:],
+            ambs[idx_start:] if ambs is not None else None,
+            parsed_times[idx_start:]
+        )
+
+    def is_turnaround_sent(self, channel_name):
+        """Prueft in SQLite, ob der Wendepunkt fuer diesen Kanal bereits gemeldet wurde."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT info_turning_point_sent FROM setting_state WHERE LOWER(channel) = LOWER(?)",
+                (str(channel_name).strip(),)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            return bool(row and row[0] == 1)
+        except Exception as e:
+            analyzer_logger.error(f"Fehler beim Pruefen von info_turning_point_sent fuer {channel_name}: {e}")
+            return False
+
+    def mark_turnaround_sent(self, channel_name):
+        """Markiert in SQLite den Wendepunkt als gesendet."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE setting_state SET info_turning_point_sent = 1 WHERE LOWER(channel) = LOWER(?)",
+                (str(channel_name).strip(),)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            analyzer_logger.error(f"Fehler beim Setzen von info_turning_point_sent fuer {channel_name}: {e}")
+
     def check_turnaround(self, channel_name, times, raw_temps, friendly_name, latest_time):
         """
-        Erkennt zuverlässig das Durchschreiten der Talsohle (Auskühlung -> Erwärmung).
-        Bedingungen:
-        1. Mindestens 0.15 °C Abkühlung vom Start/Maximum der Phase bis zum Minimum.
-        2. Anschliessender Anstieg um mindestens +0.08 °C über diesen Tiefstwert.
+        Wendepunkt-Erkennung:
+        1. Scharfschalten: Wenn ueber 10 Minuten (30 Punkte) die Tendenz negativ ist.
+        2. Ausloesen: Sobald im Anschluss ueber ca. 3 Minuten (9 Punkte) die Steigung positiv ist.
+        Prueft die Persistenz direkt ueber die Datenbank.
         """
         ch_key = str(channel_name).lower()
-        if len(raw_temps) < 30 or self.turnaround_triggered.get(ch_key, False):
+        if len(raw_temps) < 40 or self.is_turnaround_sent(channel_name):
             return
 
-        # 9-Punkte-Glättung gegen Rauschen
         smooth = pd.Series(raw_temps).rolling(window=9, min_periods=3).mean()
-        
-        # Betrachte die Historie der letzten 45 Minuten (ca. 135 Punkte bei 20s)
-        window = smooth.iloc[-135:]
-        min_temp = window.min()
-        min_idx = window.idxmin()
-        current_temp = smooth.iloc[-1]
-        
-        pre_min_window = smooth.loc[:min_idx]
-        if len(pre_min_window) < 10:
-            return
-            
-        max_before_min = pre_min_window.iloc[-60:].max() if len(pre_min_window) >= 60 else pre_min_window.max()
 
-        cooling_delta = max_before_min - min_temp
-        reheating_delta = current_temp - min_temp
+        falling_window = smooth.iloc[-39:-9]
+        rising_window = smooth.iloc[-9:]
 
-        # Kriterium: Mindestens 0.15 °C abgekühlt UND nun 0.08 °C über Minimum
-        if cooling_delta >= 0.15 and reheating_delta >= 0.08:
-            if min_idx < (len(smooth) - 3):
-                self.turnaround_triggered[ch_key] = True
+        if len(falling_window) >= 20:
+            poly_fall = np.polyfit(np.arange(len(falling_window)), falling_window.values, 1)
+            if poly_fall[0] < -0.001 and (falling_window.iloc[0] - falling_window.iloc[-1]) >= 0.10:
+                self.turnaround_armed[ch_key] = True
+
+        if self.turnaround_armed.get(ch_key, False) and len(rising_window) >= 6:
+            poly_rise = np.polyfit(np.arange(len(rising_window)), rising_window.values, 1)
+            reheating_delta = rising_window.iloc[-1] - rising_window.iloc[0]
+
+            if poly_rise[0] > 0.002 and reheating_delta >= 0.05:
+                min_temp = smooth.iloc[-39:].min()
+                self.mark_turnaround_sent(channel_name)
                 analyzer_logger.info(
                     f"[TURNAROUND EVENT] {friendly_name} ({channel_name}): "
-                    f"Minimum bei {min_temp:.2f} °C durchschritten! "
-                    f"(Abkühlung: {cooling_delta:.2f} °C, Anstieg: +{reheating_delta:.2f} °C)"
+                    f"Wendepunkt nach 10 Min Absinken erreicht! Tiefstwert: {min_temp:.2f} °C, "
+                    f"3-Min-Anstieg: +{reheating_delta:.2f} °C ({latest_time})"
                 )
                 try:
                     notifier.send_turnaround_notification(
@@ -136,7 +177,7 @@ class ConcreteSettingAnalyzer:
                 except Exception as ex:
                     analyzer_logger.error(f"Fehler beim Senden der Turnaround-Push: {ex}")
 
-    def evaluate_triggers(self, channel_name, df_history):
+    def evaluate_triggers(self, channel_name, df_history, start_time_sec=None):
         friendly_name = self.cfg.get_friendly_channel_name(channel_name)
         ch_key = str(channel_name).lower()
         
@@ -162,22 +203,26 @@ class ConcreteSettingAnalyzer:
 
         if isinstance(raw_t, (int, float)):
             latest_time = datetime.fromtimestamp(raw_t).strftime('%Y-%m-%d %H:%M:%S')
+            current_sec = float(raw_t)
         elif isinstance(raw_t, str) and len(raw_t) >= 19:
             try:
                 dt_utc = datetime.strptime(raw_t[:19], '%Y-%m-%d %H:%M:%S')
                 latest_time = dt_utc.strftime('%Y-%m-%d %H:%M:%S')
+                current_sec = dt_utc.timestamp()
             except Exception:
                 latest_time = raw_t
+                current_sec = 0.0
         else:
             latest_time = str(raw_t)
+            current_sec = 0.0
 
         latest_slope = 0.0
         latest_rotation = 0.0
 
-        # --- 1. Minimum-Turnaround-Erkennung ---
+        # --- 1. Wendepunkt-Erkennung (10min Sink / 3min Steig) ---
         self.check_turnaround(channel_name, times, raw_temps, friendly_name, latest_time)
 
-        # --- 2. Rotations-Trigger (0.000002) ---
+        # --- 2. Rotations-Trigger (Polyfit Schwellenwert 0.000002 unverändert) ---
         try:
             window_size = 30
             sub_times = times.iloc[-window_size:] if len(times) >= window_size else times
@@ -203,6 +248,16 @@ class ConcreteSettingAnalyzer:
         if all(d >= 0.05 for d in deltas):
             analyzer_logger.info(f"[TRIGGER ALARM] {friendly_name} ({channel_name}): Fallback-Kaskade ausgeloest! 5x Delta >= 0.05 Grad C ({np.round(deltas, 2)}) bei {latest_temp:.2f} Grad C ({latest_time})")
             return "fallback_trigger", latest_time, latest_temp, latest_rotation, latest_slope
+
+        # --- 4. 6h-Fallback: Analyse mittels Tangentenmethode bei Normalbeton ---
+        if start_time_sec and (current_sec - start_time_sec) >= (6 * 3600):
+            try:
+                t_ab, temp_ab, _, _, _, _ = self.calculate_tangent_intersection(times.values, temps.values)
+                if t_ab is not None:
+                    analyzer_logger.info(f"[6H-FALLBACK TRIGGER] {friendly_name} ({channel_name}): Tangentenschnittpunkt nach 6h gefunden: {t_ab} bei {temp_ab:.2f} Grad C")
+                    return "6h_tangent_fallback", t_ab, temp_ab, latest_rotation, latest_slope
+            except Exception as e_6h:
+                analyzer_logger.error(f"Fehler beim 6h-Fallback fuer {channel_name}: {e_6h}")
 
         analyzer_logger.info(f"[Audit] {friendly_name} ({channel_name}) | Punkte: {len(raw_temps)} | Temp: {latest_temp:.2f} Grad C | Rotation: {latest_rotation:.9f} | Deltas: {np.round(deltas, 2)}")
 

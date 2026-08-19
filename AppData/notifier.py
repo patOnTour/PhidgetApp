@@ -4,20 +4,24 @@
 """
 Modul: notifier.py
 Beschreibung: Verwaltet den ntfy.sh Versand für Beton-Messungen, CSV/Plot-Anhänge,
-Turnaround-Events sowie geschützte Admin-Meldungen unter Nutzung des zentralen ConfigLoaders.
-Version: v3.2-prod (Minimum-Turnaround Benachrichtigung integriert)
+              Turnaround-Events sowie geschützte Admin-Meldungen unter Berücksichtigung
+              der Server-Listener Triggerwörter.
+Version: v3.3-prod (Exakte Server-Kompatibilität für TRIGGER/ALARM/FERTIG)
 """
 
 import os
 import requests
 import logging
+import subprocess
+from datetime import datetime
 from config_loader import ConfigLoader
 
 logger = logging.getLogger("Notifier")
 cfg = ConfigLoader()
 
+
 def get_ntfy_url(admin=False):
-    """Liest den ntfy-Kanal direkt und ohne stille Fallbacks aus der secrets.json"""
+    """Liest den ntfy-Kanal direkt und ohne stille Fallbacks aus der secrets.json."""
     secrets = cfg.secrets
     
     if admin:
@@ -29,18 +33,17 @@ def get_ntfy_url(admin=False):
         return f"https://ntfy.sh/{channel.strip()}"
     return ""
 
+
 def send_push_notification(title, message, tags="", priority="default", attachment_file=None, attachment_name=None, admin=False):
-    """Sendet Push-Benachrichtigungen an den ntfy.sh Kanal (inkl. Datei-/Plot-Anhang)"""
+    """Sendet Push-Benachrichtigungen an den ntfy.sh Kanal (inkl. Datei-/Plot-Anhang)."""
     url = get_ntfy_url(admin=admin)
     if not url:
         logger.error("Kein ntfy-Kanal in secrets.json definiert.")
         return False
         
-    clean_title = title
-    
     try:
         headers = {
-            "Title": clean_title,
+            "Title": title,
             "Tags": str(tags),
             "Priority": str(priority)
         }
@@ -67,25 +70,27 @@ def send_push_notification(title, message, tags="", priority="default", attachme
                 timeout=20
             )
 
-        logger.info(f"Push gesendet an {'Admin' if admin else 'Haupt'}-Kanal: {clean_title}")
+        logger.info(f"Push gesendet an {'Admin' if admin else 'Haupt'}-Kanal: {title}")
         return response.status_code == 200
 
     except Exception as e:
         logger.error(f"Fehler beim Senden der Notification: {e}")
         return False
 
+
 def send_turnaround_notification(channel, temp, timestamp, admin=False):
-    """Sendet eine Push-Benachrichtigung bei Übergang von Abkühlung zu Erwärmung."""
+    """
+    Sendet eine reine Info-Push bei Wendepunkt (Auskühlung beendet).
+    WICHTIG: Enthält kein 'ALARM'/'TRIGGER'/'FERTIG', um Fehltrigger am Server zu vermeiden.
+    """
     friendly_name = cfg.get_friendly_channel_name(channel)
     device_name = cfg.device_name_friendly
 
-    title = f"🌡️ Minimum erreicht [{friendly_name}]"
+    title = f"ℹ️ Info: Temperaturanstieg [{friendly_name}]"
     message = (
-        f"Auskühlung beendet – Erwärmung hat begonnen!\n"
-        f"• Gerät: {device_name}\n"
-        f"• Kanal: {friendly_name} ({channel})\n"
-        f"• Tiefsttemperatur: {temp:.2f} °C\n"
-        f"• Zeitpunkt: {timestamp}"
+        f"Kanal: {friendly_name} (`{channel}`)\n"
+        f"Temperaturanstieg/Wendepunkt um {timestamp} erkannt (T = {temp:.1f} °C).\n"
+        f"Überwachung auf Abbindebeginn läuft..."
     )
     return send_push_notification(
         title=title,
@@ -95,15 +100,61 @@ def send_turnaround_notification(channel, temp, timestamp, admin=False):
         admin=admin
     )
 
+
+def send_setting_alarm_notification(channel, trigger_type, t_ab_str, temp_ab, admin=False):
+    """
+    Sendet den harten Abbinde-Alarm.
+    Triggert das Server-Backend zuverlässig über 'ALARM' / 'TRIGGER'.
+    """
+    friendly_name = cfg.get_friendly_channel_name(channel)
+    device_name = cfg.device_name_friendly
+
+    title = f"🔥 Beton-Alarm: Abbindebeginn [{friendly_name}]!"
+    message = (
+        f"• Gerät: {device_name}\n"
+        f"• Kanal: {friendly_name} (`{channel}`): TRIGGERED\n"
+        f"• Abbindebeginn um {t_ab_str} erreicht ({trigger_type}).\n"
+        f"• Temperatur: {temp_ab:.1f} °C\n"
+        f"• Nachlaufzeit: 30 Min bis Auto-Export gestartet."
+    )
+    return send_push_notification(
+        title=title,
+        message=message,
+        tags="fire,rotating_light",
+        priority="high",
+        admin=admin
+    )
+
+
+def send_completion_notification(channel, t_ab_str, admin=False):
+    """
+    Sendet die Abschlussmeldung nach 30-Minuten-Nachlauf.
+    Triggert das Server-Backend via 'FERTIG' zur Archivierung.
+    """
+    friendly_name = cfg.get_friendly_channel_name(channel)
+    device_name = cfg.device_name_friendly
+
+    title = f"✅ Beton-Abschlussbericht: FERTIG [{friendly_name}]"
+    message = (
+        f"• Gerät: {device_name}\n"
+        f"• Kanal: {friendly_name} (`{channel}`): FINISHED / STOPPED\n"
+        f"• Abbindepunkt: {t_ab_str}\n"
+        f"• 30 min Nachlauf abgeschlossen. Messung gestoppt."
+    )
+    return send_push_notification(
+        title=title,
+        message=message,
+        tags="bar_chart,white_check_mark",
+        priority="default",
+        admin=admin
+    )
+
+
 def send_startup_notification(ip_address, device_name):
     """Sendet eine Push-Benachrichtigung beim Systemstart auf den Admin-Kanal mit Interaktions-Buttons."""
-    import subprocess
-    from datetime import datetime
-    
-    cfg = ConfigLoader()
     admin_channel = cfg.admin_ntfy_channel
     if not admin_channel:
-        print("[Notifier] Kein Admin-ntfy-Kanal konfiguriert.", flush=True)
+        logger.warning("[Notifier] Kein Admin-ntfy-Kanal konfiguriert.")
         return
 
     pretty_name = cfg.device_name_friendly
@@ -120,7 +171,7 @@ def send_startup_notification(ip_address, device_name):
         if "Timezone=" in res_tz.stdout:
             timezone_str = res_tz.stdout.strip().split("=", 1)[1]
     except Exception as e:
-        print(f"[Notifier] Fehler beim Auslesen der Zeitzone: {e}", flush=True)
+        logger.error(f"[Notifier] Fehler beim Auslesen der Zeitzone: {e}")
 
     sync_status_str = "🟢 OK (Synchron)" if ntp_ok else "⚠️ NEIN (Gepuffert)"
     current_time_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
@@ -158,6 +209,6 @@ def send_startup_notification(ip_address, device_name):
 
     try:
         requests.post("https://ntfy.sh", json=payload, timeout=10)
-        print(f"[Notifier] Startup-Notification erfolgreich an Admin-Kanal '{admin_channel}' gesendet.", flush=True)
+        logger.info(f"[Notifier] Startup-Notification erfolgreich an Admin-Kanal '{admin_channel}' gesendet.")
     except Exception as e:
-        print(f"[Notifier] Fehler beim Senden der Startup-Notification: {e}", flush=True)
+        logger.error(f"[Notifier] Fehler beim Senden der Startup-Notification: {e}")

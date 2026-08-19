@@ -351,6 +351,7 @@ class ConcreteApp:
         self.reader.setup_sensors()
 
         housekeeping_counter = 0
+        time_state_counter = 0
 
         while True:
             loop_start = time.time()
@@ -362,7 +363,11 @@ class ConcreteApp:
                     self.db.run_housekeeping()
                     housekeeping_counter = 0
 
-                self.save_current_time_state()
+                # Zeitstatus nur alle 5 Minuten (15 x 20s) auf Disk schreiben
+                time_state_counter += 1
+                if time_state_counter >= 15:
+                    self.save_current_time_state()
+                    time_state_counter = 0
 
                 telemetry_averages = self.reader.collect_oversampled_telemetry(duration_seconds=20, sample_interval=1.0)
                 self.last_telemetry_values = telemetry_averages

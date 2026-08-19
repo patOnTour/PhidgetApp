@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Modul: sync_worker.py
+Beschreibung: Robuster Hintergrund-Synchronisationsdienst fuer Telemetriedaten zum NAS/Server.
+              Mappt technische Spaltennamen 1:1 auf 0-basierte Kanal-IDs (temp0=0 ... temp7=7, ambient=100, humidity=101).
+Version: 2.3.0 (Exaktes 0-basiertes Index-Mapping fuer Server-Dashboard)
+"""
+
 import os
 import sys
 import time
 import json
 import sqlite3
 import logging
+import subprocess
 from datetime import datetime, timezone
 import requests
 
-# Pfade für lokale Imports einrichten
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
 for p in [current_dir, parent_dir]:
@@ -18,79 +25,128 @@ for p in [current_dir, parent_dir]:
         sys.path.insert(0, p)
 
 from config_loader import ConfigLoader
+from telemetry_db import TelemetryDB
 
-# VERSION: 2.0.0
-
-# 1. Konfiguration zentral laden
 cfg = ConfigLoader()
 DEVICE_ID = cfg.device_name_technical
-CHANNEL_MAP = cfg.get_channel_id_map()
+DB_PATH = os.path.join(current_dir, "telemetry_buffer.db")
 
-DB_PATH = "/usr/userapps/PhidgetProject/AppData/telemetry_buffer.db"
 NAS_ENDPOINT = "https://telemetry.concretum-setting.com/api/v1/telemetry/ingest"
 API_TOKEN = "DeinGeheimerApiToken456!"
 BATCH_SIZE = 100
-SYNC_INTERVAL = 30
+SYNC_INTERVAL = 20
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] [SyncWorker] %(message)s"
 )
+logger = logging.getLogger("SyncWorker")
+
 
 def resolve_channel_index(col_name: str) -> int:
-    col_lower = col_name.lower().strip()
-    if col_lower in CHANNEL_MAP:
-        return CHANNEL_MAP[col_lower]
-    return 200 + abs(hash(col_lower)) % 100
+    """
+    Mappt die Spaltennamen exakt auf die vom Server erwarteten Zahlen:
+    - temp0 -> 0 (Kanal 1)
+    - temp1 -> 1 (Kanal 2)
+    - ...
+    - temp7 -> 7 (Kanal 8)
+    - ambient -> 100
+    - humidity -> 101
+    """
+    col = col_name.lower().strip()
+    
+    if col in ["ambient", "ambient_temp", "umgebung"]:
+        return 100
+    if col in ["humidity", "luftfeuchtigkeit", "feuchte"]:
+        return 101
+
+    if col.startswith("temp"):
+        suffix = col[4:]
+        if suffix.isdigit():
+            return int(suffix)
+
+    return 200 + (abs(hash(col)) % 100)
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp REAL NOT NULL,
-            synced INTEGER DEFAULT 0
-        );
-    """)
-
-    cursor.execute("PRAGMA table_info(telemetry)")
-    existing_cols = [col[1].lower() for col in cursor.fetchall()]
-
-    for ch in CHANNEL_MAP.keys():
-        if ch not in existing_cols:
-            try:
-                cursor.execute(f"ALTER TABLE telemetry ADD COLUMN {ch} REAL;")
-                logging.info(f"Spalte '{ch}' zur SQLite-Tabelle 'telemetry' hinzugefuegt.")
-            except sqlite3.OperationalError:
-                pass
-
-    if "synced" not in existing_cols:
+def execute_system_command(cmd_id: int, command: str, payload_raw: str):
+    logger.info(f"[RemoteCommand] Fuehre Befehl #{cmd_id} aus: '{command}'")
+    payload = {}
+    if payload_raw:
         try:
-            cursor.execute("ALTER TABLE telemetry ADD COLUMN synced INTEGER DEFAULT 0;")
-        except sqlite3.OperationalError:
-            pass
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+        except Exception:
+            payload = {}
 
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_synced_id ON telemetry(synced, id);")
+    success = False
+    try:
+        if command == "restart_service":
+            service_name = payload.get("service", "phidget-app.service")
+            res = subprocess.run(["systemctl", "restart", service_name], capture_output=True, text=True, timeout=10)
+            success = (res.returncode == 0)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_commands (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at TEXT NOT NULL,
-            command TEXT NOT NULL,
-            payload TEXT,
-            executed INTEGER DEFAULT 0
-        );
-    """)
+        elif command == "reboot_system":
+            logger.warning("[RemoteCommand] System-Reboot via Ingest-API angefordert!")
+            subprocess.Popen(["sleep", "3", "&&", "reboot"], shell=True)
+            success = True
 
-    conn.commit()
-    conn.close()
+        elif command == "resync_range":
+            start_ts = payload.get("start_ts")
+            end_ts = payload.get("end_ts")
+            if start_ts and end_ts:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("UPDATE telemetry SET synced = 0 WHERE timestamp >= ? AND timestamp <= ?", (start_ts, end_ts))
+                conn.commit()
+                conn.close()
+                logger.info(f"[RemoteCommand] Telemetriedaten von {start_ts} bis {end_ts} fuer Resync markiert.")
+                success = True
+
+        elif command == "custom_sql":
+            query = payload.get("query")
+            if query and not query.strip().lower().startswith("drop"):
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute(query)
+                conn.commit()
+                conn.close()
+                success = True
+
+        else:
+            logger.warning(f"[RemoteCommand] Unbekannter Befehl: {command}")
+
+    except Exception as e:
+        logger.error(f"[RemoteCommand] Fehler bei Ausfuehrung von #{cmd_id} ({command}): {e}")
+        success = False
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE system_commands SET executed = ? WHERE id = ?", (1 if success else 2, cmd_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Fehler beim Aktualisieren von system_commands: {e}")
+
+
+def process_pending_commands():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id, command, payload FROM system_commands WHERE executed = 0 ORDER BY id ASC LIMIT 5")
+        rows = cur.fetchall()
+        conn.close()
+
+        for r in rows:
+            execute_system_command(r["id"], r["command"], r["payload"])
+    except Exception as e:
+        logger.error(f"Fehler beim Auslesen anstehender System-Befehle: {e}")
+
 
 def sync_batch():
     conn = get_db()
@@ -100,7 +156,7 @@ def sync_batch():
     cols = [col["name"].lower() for col in cursor.fetchall()]
     value_cols = [c for c in cols if c not in ("id", "timestamp", "synced")]
 
-    cursor.execute(f"""
+    cursor.execute("""
         SELECT * FROM telemetry 
         WHERE COALESCE(synced, 0) = 0 
         ORDER BY id ASC 
@@ -130,7 +186,6 @@ def sync_batch():
             val = row[col]
             if val is not None:
                 ch_idx = resolve_channel_index(col)
-
                 records_dict[(iso_ts, ch_idx)] = {
                     "timestamp": iso_ts,
                     "channel": ch_idx,
@@ -154,7 +209,7 @@ def sync_batch():
 
     try:
         headers = {"Authorization": f"Bearer {API_TOKEN}"}
-        res = requests.post(NAS_ENDPOINT, json=payload, headers=headers, timeout=15.0)
+        res = requests.post(NAS_ENDPOINT, json=payload, headers=headers, timeout=12.0)
 
         if res.status_code == 200:
             placeholders = ",".join("?" for _ in synced_ids)
@@ -169,21 +224,24 @@ def sync_batch():
                     """, (cmd.get("command"), json.dumps(cmd.get("payload", {}))))
 
             conn.commit()
-            logging.info(f"Sync erfolgreich ({DEVICE_ID}): {len(synced_ids)} Zeilen ({len(records)} Messpunkte) uebertragen.")
+            logger.info(f"Sync erfolgreich ({DEVICE_ID}): {len(synced_ids)} Zeilen ({len(records)} Messpunkte) uebertragen.")
         else:
-            logging.warning(f"NAS API meldet Fehler {res.status_code}: {res.text}")
+            logger.warning(f"NAS API meldet Status {res.status_code}: {res.text}")
 
     except requests.exceptions.RequestException as e:
-        logging.warning(f"Sync fehlgeschlagen (Netzwerkfehler): {e}")
+        logger.debug(f"Sync aktuell nicht erreichbar (Offline): {e}")
     finally:
         conn.close()
 
+
 if __name__ == "__main__":
-    logging.info(f"Phidget Telemetry Sync-Worker gestartet fuer Device: {DEVICE_ID}")
-    init_db()
+    logger.info(f"Phidget Telemetry Sync-Worker gestartet fuer Device: {DEVICE_ID}")
+    TelemetryDB(DB_PATH)
+    
     while True:
         try:
             sync_batch()
+            process_pending_commands()
         except Exception as e:
-            logging.error(f"Unerwarteter Fehler im Sync-Loop: {e}")
+            logger.error(f"Unerwarteter Fehler im Sync-Loop: {e}")
         time.sleep(SYNC_INTERVAL)

@@ -207,12 +207,7 @@ def control_channel():
         db.reset_channel(channel)
         msg_text = f"Kanal '{channel}' zurückgesetzt (RESET)!"
     elif action_upper == 'EXPORT':
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('UPDATE channel_control SET force_export = 1, updated_at = ? WHERE LOWER(channel) = LOWER(?)', (now_str, channel))
-        conn.commit()
-        conn.close()
+        db.request_export(channel)
         msg_text = f"Manueller Export für '{channel}' angefordert!"
         
     return redirect(url_for('index', msg=msg_text, msg_type="success"))
