@@ -4,7 +4,7 @@
 """
 Modul: app.py
 Beschreibung: Schlanker 1-Hz-Messdatenlogger fuer Phidget-Sensoren mit SQLite-Pufferung.
-Version: 3.1.0 (Edge-Decoupled, In-Memory-Batching)
+Version: 3.1.2 (UTC ISO-8601 Timestamps, Edge-Decoupled)
 """
 
 import time
@@ -14,7 +14,7 @@ import json
 import sqlite3
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Phidget22 Bibliotheken
 try:
@@ -42,9 +42,12 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 class PhidgetLoggerApp:
     def __init__(self):
         self.config_loader = ConfigLoader()
-        self.config = self.config_loader.load_config()
+        self.config = self.config_loader.main_config
         self.device_id = self.config.get("device_name", "ccssite01")
-        self.db = TelemetryDB()
+        
+        self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telemetry_buffer.db")
+        self.db = TelemetryDB(self.db_path)
+        
         self.sensors = []
         self.running = True
         self.memory_buffer = []
@@ -58,7 +61,7 @@ class PhidgetLoggerApp:
         for s_conf in self.config.get("sensors", []):
             port = s_conf.get("port")
             stype = s_conf.get("sensor_type")
-            tkey = s_conf.get("telemetry_key", "temp")
+            tkey = s_conf.get("telemetry_key", "temp").lower()
 
             if stype == "tc_4port":
                 for ch in range(4):
@@ -68,7 +71,7 @@ class PhidgetLoggerApp:
                         sensor.setHubPort(port)
                         sensor.setChannel(ch)
                         sensor.setIsHubPortDevice(False)
-                        if phidget_serial > 0:
+                        if phidget_serial and phidget_serial > 0:
                             sensor.setDeviceSerialNumber(phidget_serial)
                         sensor.openWaitForAttachment(3000)
                         sensor.setDataInterval(1000)  # 1000ms = 1 Hz
@@ -83,7 +86,7 @@ class PhidgetLoggerApp:
                     sensor = TemperatureSensor()
                     sensor.setHubPort(port)
                     sensor.setIsHubPortDevice(False)
-                    if phidget_serial > 0:
+                    if phidget_serial and phidget_serial > 0:
                         sensor.setDeviceSerialNumber(phidget_serial)
                     sensor.openWaitForAttachment(3000)
                     sensor.setDataInterval(1000)
@@ -92,14 +95,13 @@ class PhidgetLoggerApp:
                     logger.warning(f"Konnte TMP1101 Port {port} nicht binden: {e}")
 
     def read_all(self):
-        now_dt = datetime.now()
-        timestamp_str = now_dt.strftime('%Y-%m-%d %H:%M:%S')
-        row = {"timestamp": timestamp_str}
+        # Exakter UTC-Timestamp mit Z-Suffix
+        timestamp_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        row = {"timestamp": timestamp_str, "ambient": 20.0, "humidity": 50.0}
         
         for sensor, key in self.sensors:
             try:
                 temp = sensor.getTemperature()
-                # Physische Plausibilitaet
                 row[key] = round(temp, 3) if (-40.0 <= temp <= 125.0) else None
             except Exception:
                 row[key] = None
@@ -113,13 +115,11 @@ class PhidgetLoggerApp:
         cursor = conn.cursor()
         try:
             cursor.execute("PRAGMA journal_mode = WAL;")
-            
-            # Hole Spalten der Tabelle
             cursor.execute("PRAGMA table_info(telemetry);")
-            columns = [col[1] for col in cursor.fetchall()]
+            columns = [col[1].lower() for col in cursor.fetchall()]
             
             for entry in self.memory_buffer:
-                entry_keys = [k for k in entry.keys() if k in columns]
+                entry_keys = [k for k in entry.keys() if k.lower() in columns]
                 placeholders = ", ".join(["?"] * len(entry_keys))
                 cols_str = ", ".join(entry_keys)
                 vals = [entry[k] for k in entry_keys]
@@ -142,14 +142,12 @@ class PhidgetLoggerApp:
                 data_point = self.read_all()
                 self.memory_buffer.append(data_point)
                 
-                # Alle 5 Sekunden gesammelt in SQLite flashen
                 if time.time() - self.last_db_flush >= 5.0 or len(self.memory_buffer) >= 5:
                     self.flush_to_sqlite()
                     
             except Exception as e:
                 logger.error(f"Fehler im 1-Hz Messloop: {e}")
 
-            # Exakten 1-Sekunden-Takt halten
             elapsed = time.time() - loop_start
             sleep_time = max(0.05, 1.0 - elapsed)
             time.sleep(sleep_time)
