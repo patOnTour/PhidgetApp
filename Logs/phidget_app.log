@@ -1,0 +1,24 @@
+2026-08-21 13:51:13,073 [INFO] Initialisiere Phidgets fuer Device: ebirec (Hub-Serial: 802558)
+2026-08-21 13:51:13,593 [INFO] Ambient-Temperatur gebunden: Port 0 -> Spalte 'ambient'
+2026-08-21 13:51:14,025 [INFO] Luftfeuchte-Sensor gebunden: Port 0 -> Spalte 'humidity'
+2026-08-21 13:51:16,633 [INFO] Sensor gebunden: Port 1, Ch 0 -> Spalte 'temp0'
+2026-08-21 13:51:19,237 [INFO] Sensor gebunden: Port 1, Ch 1 -> Spalte 'temp1'
+2026-08-21 13:51:21,827 [INFO] Sensor gebunden: Port 1, Ch 2 -> Spalte 'temp2'
+2026-08-21 13:51:24,423 [INFO] Sensor gebunden: Port 1, Ch 3 -> Spalte 'temp3'
+2026-08-21 13:51:27,038 [INFO] Sensor gebunden: Port 2, Ch 0 -> Spalte 'temp4'
+2026-08-21 13:51:29,627 [INFO] Sensor gebunden: Port 2, Ch 1 -> Spalte 'temp5'
+2026-08-21 13:51:32,230 [INFO] Sensor gebunden: Port 2, Ch 2 -> Spalte 'temp6'
+2026-08-21 13:51:34,838 [INFO] Sensor gebunden: Port 2, Ch 3 -> Spalte 'temp7'
+2026-08-21 13:51:34,839 [INFO] Mess-Schleife gestartet.
+2026-08-21 14:41:42,139 [INFO] Initialisiere Phidgets fuer Device: ebirec (Hub-Serial: 802558)
+2026-08-21 14:41:42,605 [INFO] Ambient-Temperatur gebunden: Port 0 -> Spalte 'ambient'
+2026-08-21 14:41:43,041 [INFO] Luftfeuchte-Sensor gebunden: Port 0 -> Spalte 'humidity'
+2026-08-21 14:41:45,641 [INFO] Sensor gebunden: Port 1, Ch 0 -> Spalte 'temp0'
+2026-08-21 14:41:48,219 [INFO] Sensor gebunden: Port 1, Ch 1 -> Spalte 'temp1'
+2026-08-21 14:41:50,805 [INFO] Sensor gebunden: Port 1, Ch 2 -> Spalte 'temp2'
+2026-08-21 14:41:53,399 [INFO] Sensor gebunden: Port 1, Ch 3 -> Spalte 'temp3'
+2026-08-21 14:41:56,000 [INFO] Sensor gebunden: Port 2, Ch 0 -> Spalte 'temp4'
+2026-08-21 14:41:58,610 [INFO] Sensor gebunden: Port 2, Ch 1 -> Spalte 'temp5'
+2026-08-21 14:42:01,191 [INFO] Sensor gebunden: Port 2, Ch 2 -> Spalte 'temp6'
+2026-08-21 14:42:03,778 [INFO] Sensor gebunden: Port 2, Ch 3 -> Spalte 'temp7'
+2026-08-21 14:42:03,779 [INFO] Mess-Schleife gestartet.
