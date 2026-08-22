@@ -25,7 +25,7 @@ import notifier
 from config_loader import ConfigLoader
 from telemetry_db import TelemetryDB
 
-VERSION = "5.3.0"
+VERSION = "5.3.1"
 
 config_loader = ConfigLoader()
 db_path = os.path.join(app_data_dir, "telemetry_buffer.db")

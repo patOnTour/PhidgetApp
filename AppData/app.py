@@ -131,7 +131,7 @@ def main():
             # 2. Dynamische Abtastrate definieren
             cycle_target_duration = 1.0 if is_measuring else 5.0
 
-            # 3. Sensordaten abfragen
+            # 3. Sensordaten abfragen (IMMER alle Kanäle erfassen)
             telemetry_data = {}
             live_temps = {}
 
@@ -150,13 +150,9 @@ def main():
                         if val is not None:
                             val_float = round(float(val), 2)
                             live_temps[key] = val_float
-                            # Thermoelement-Werte nur speichern, wenn Kanal aktiv ist (oder als Standby miterfassen)
-                            if is_measuring and key in active_channels:
-                                telemetry_data[key.lower()] = val_float
-                            else:
-                                telemetry_data[key.lower()] = None
+                            # Thermoelement-Werte IMMER erfassen (fuer Sonden-Erkennung auf NAS)
+                            telemetry_data[key.lower()] = val_float
                 except Exception:
-                    # Sensorabfrage-Fehler fangen (z.B. Fühler ausgesteckt)
                     if stype == "tc":
                         telemetry_data[key.lower()] = None
 
