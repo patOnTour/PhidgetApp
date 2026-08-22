@@ -1,0 +1,13 @@
+# Sensible Konfiguration (niemals committen!)
+config/config.yaml
+
+# Temporäre Daten & RAM-Disk
+*.db
+*.db-wal
+*.db-shm
+/tmp/*
+
+# Logs & Python Cache
+*.log
+__pycache__/
+*.pyc
