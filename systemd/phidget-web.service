@@ -1,0 +1,14 @@
+[Unit]
+Description=Phidget WebGUI and LCD Controller Service
+After=network.target phidget-reader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_web.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

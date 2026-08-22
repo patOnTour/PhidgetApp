@@ -1,0 +1,15 @@
+[Unit]
+Description=Phidget Network Monitor, Boot Notification & WiFi Recovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_netmon.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

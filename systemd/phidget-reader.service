@@ -1,0 +1,16 @@
+[Unit]
+Description=Phidget 10Hz Oversampling Measurement Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_reader.py
+Restart=always
+RestartSec=3
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=99
+
+[Install]
+WantedBy=multi-user.target

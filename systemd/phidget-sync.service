@@ -1,0 +1,14 @@
+[Unit]
+Description=Phidget Telemetry Sync Worker
+After=network.target phidget-reader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/sync_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
