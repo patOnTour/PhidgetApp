@@ -3,9 +3,8 @@
 
 """
 Modul: ntfy_control_listener.py
-Beschreibung: Empfaengt Ntfy-Befehle (Text & JSON), steuert dynamische Menues
-              und verarbeitet interaktive Action-Buttons mit Paginierung.
-Version: 5.0.0 (Gefuehrte Menue-Architektur mit Paginierung)
+Beschreibung: Empfaengt ntfy-Befehle ueber den eigenen Server und steuert die Box.
+Version: 5.2.0 (Dynamische Server-URL Support)
 """
 
 import os
@@ -23,11 +22,13 @@ sys.path.append(current_dir)
 from config_loader import ConfigLoader
 from telemetry_db import TelemetryDB
 
-VERSION = "5.0.0"
-
 cfg = ConfigLoader()
 DB_PATH = os.path.join(current_dir, "telemetry_buffer.db")
 db = TelemetryDB(DB_PATH)
+
+
+def get_base_url():
+    return cfg.secrets.get("ntfy", {}).get("server_url", "https://ntfy.concretum-setting.com").rstrip("/")
 
 
 def get_local_ip():
@@ -52,7 +53,6 @@ def get_channel_data():
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            # Telemetrie lesen
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='telemetry';")
             if cursor.fetchone():
                 cursor.execute("PRAGMA table_info(telemetry)")
@@ -72,7 +72,6 @@ def get_channel_data():
                     if row_amb and row_amb[0] is not None:
                         ambient_temp = row_amb[0]
 
-            # Kanal-Status lesen
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_control';")
             if cursor.fetchone():
                 cursor.execute("PRAGMA table_info(channel_control)")
@@ -83,7 +82,7 @@ def get_channel_data():
                 cursor.execute(f"SELECT {name_col}, {status_col}, force_export FROM channel_control")
                 for r in cursor.fetchall():
                     ch_name = r[name_col]
-                    st = (r[status_col] or 'RESET').upper()
+                    st = (r[status_col] or 'STOPPED').upper()
                     fx = r['force_export'] if 'force_export' in r.keys() else 0
                     channel_controls[ch_name] = "EXPORT" if fx == 1 else st
                     
@@ -95,8 +94,8 @@ def get_channel_data():
 
 
 def send_menu_response(title, message, actions, tags=None):
-    """Standardisierter Helper zum Senden interaktiver ntfy-Nachrichten."""
     ntfy_channel = cfg.ntfy_channel
+    base_url = get_base_url()
     payload = {
         "topic": ntfy_channel,
         "title": title,
@@ -108,17 +107,17 @@ def send_menu_response(title, message, actions, tags=None):
         payload["tags"] = tags
         
     try:
-        requests.post("https://ntfy.sh", json=payload, timeout=10)
+        requests.post(base_url, json=payload, timeout=10)
     except Exception as e:
-        print(f"[NtfyControlListener] Fehler beim Senden des Menü-Payloads: {e}", flush=True)
+        print(f"[NtfyControlListener] Fehler beim Senden: {e}", flush=True)
 
 
 def handle_sys_info():
-    """Sendet Detail-Informationen über System, Netzwerk und Zeitzone."""
     local_ip = get_local_ip()
     web_gui_url = f"http://{local_ip}:8081"
     pretty_name = cfg.device_name_friendly
     tech_name = cfg.device_name_technical
+    base_url = get_base_url()
     
     ntp_ok = False
     timezone_str = "UTC"
@@ -136,7 +135,7 @@ def handle_sys_info():
     now_str = datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')
 
     msg = (
-        f"**Gerät:** {pretty_name} (`{tech_name}`)\n"
+        f"**Geraet:** {pretty_name} (`{tech_name}`)\n"
         f"**IP-Adresse:** {local_ip}\n"
         f"**WebGUI:** {web_gui_url}\n"
         f"**Zeitzone:** {timezone_str}\n"
@@ -153,14 +152,14 @@ def handle_sys_info():
         {
             "action": "http",
             "label": "⏰ Uhrzeit Sync",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": "sync_time"
         },
         {
             "action": "http",
             "label": "📊 Status",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": "status"
         }
@@ -170,25 +169,19 @@ def handle_sys_info():
 
 
 def handle_status_overview():
-    """Zeigt den Haupt-Status mit Aktionen für 'Info' und 'Kanäle'."""
     values, controls, ambient = get_channel_data()
     pretty_name = cfg.device_name_friendly
+    base_url = get_base_url()
     
     lines = []
     for tech_key in cfg.get_temperature_channels():
         friendly_name = cfg.get_friendly_channel_name(tech_key)
         val = values.get(tech_key, 'N/A')
         val_str = f"{val:.1f} °C" if isinstance(val, (int, float)) else "N/A"
-        ctrl = controls.get(tech_key, 'RESET')
+        ctrl = controls.get(tech_key, 'STOPPED')
         
-        if ctrl == 'TRIGGERED':
-            status_str = "🔴 TRIGGERED"
-        elif ctrl in ['RUNN', 'RUNNING']:
-            status_str = "🟢 RUNNING"
-        else:
-            status_str = "⚪ RESET"
-            
-        lines.append(f"• **{friendly_name}** (`{tech_key}`): {status_str} | **{val_str}**")
+        status_tag = "TRIGGERED" if ctrl == 'TRIGGERED' else ("RUNNING" if ctrl in ['RUNN', 'RUNNING'] else "STOPPED")
+        lines.append(f"• **{friendly_name}** (`{tech_key}`): {status_tag} | **{val_str}**")
 
     amb_str = f"{ambient:.1f} °C" if ambient is not None else "N/A"
     now_str = datetime.now().astimezone().strftime('%H:%M Uhr')
@@ -199,14 +192,14 @@ def handle_status_overview():
         {
             "action": "http",
             "label": "ℹ️ Info",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": json.dumps({"cmd": "sys_info"})
         },
         {
             "action": "http",
-            "label": "🎛️ Kanäle",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "label": "🎛️ Kanaele",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": json.dumps({"cmd": "list_channels", "page": 1})
         }
@@ -216,12 +209,11 @@ def handle_status_overview():
 
 
 def handle_list_channels(page=1):
-    """Listet Temperaturkanäle auf max. 3 Buttons auf (Paginierung)."""
     channels = cfg.get_temperature_channels()
     total_channels = len(channels)
     pretty_name = cfg.device_name_friendly
+    base_url = get_base_url()
     
-    # 2 Kanäle pro Seite bei Paginierung (1 Slot reserviert für "Weiter")
     items_per_page = 2
     total_pages = (total_channels + items_per_page - 1) // items_per_page
     if page > total_pages:
@@ -236,47 +228,39 @@ def handle_list_channels(page=1):
         friendly = cfg.get_friendly_channel_name(ch)
         actions.append({
             "action": "http",
-            "label": friendly[:12], # Kürzen falls Name zu lang
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "label": friendly[:12],
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": json.dumps({"cmd": "channel_view", "channel": ch})
         })
 
-    # Paginierungs-Button hinzufügen falls mehrere Seiten
     if total_pages > 1:
         next_page = (page % total_pages) + 1
         actions.append({
             "action": "http",
             "label": f"Weiter ▶ ({next_page}/{total_pages})",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": json.dumps({"cmd": "list_channels", "page": next_page})
         })
 
-    msg = f"Wähle einen Kanal zur Detailansicht und Steuerung (Seite {page}/{total_pages}):"
+    msg = f"Waehle einen Kanal zur Detailansicht und Steuerung (Seite {page}/{total_pages}):"
     send_menu_response(f"🎛️ KANAL-AUSWAHL [{pretty_name}]", msg, actions, tags=["control_knobs"])
 
 
 def handle_channel_view(tech_key):
-    """Zeigt Live-Details eines spezifischen Kanals mit Steuerungs-Buttons."""
     values, controls, _ = get_channel_data()
     friendly_name = cfg.get_friendly_channel_name(tech_key)
     pretty_name = cfg.device_name_friendly
+    base_url = get_base_url()
     
     val = values.get(tech_key, 'N/A')
     val_str = f"{val:.1f} °C" if isinstance(val, (int, float)) else "N/A"
-    ctrl = controls.get(tech_key, 'RESET')
-
-    if ctrl == 'TRIGGERED':
-        st_text = "🔴 Abbindebeginn erkannt (TRIGGERED)"
-    elif ctrl in ['RUNN', 'RUNNING']:
-        st_text = "🟢 Messung läuft (RUNNING)"
-    else:
-        st_text = "⚪ Bereit / Inaktiv (RESET)"
+    ctrl = controls.get(tech_key, 'STOPPED')
 
     msg = (
         f"• **Kanal:** {friendly_name} (`{tech_key}`)\n"
-        f"• **Status:** {st_text}\n"
+        f"• **Status:** `{tech_key}`: {ctrl}\n"
         f"• **Temperatur:** {val_str}\n"
         f"• **Letztes Update:** {datetime.now().astimezone().strftime('%H:%M:%S Uhr')}"
     )
@@ -285,21 +269,21 @@ def handle_channel_view(tech_key):
         {
             "action": "http",
             "label": "▶️ Start (RUNN)",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
-            "body": f"runn:{tech_key}"
+            "body": f"start:{tech_key}"
         },
         {
             "action": "http",
-            "label": "🔄 Reset",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "label": "🔄 Reset (STOP)",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": f"reset:{tech_key}"
         },
         {
             "action": "http",
             "label": "📊 Export",
-            "url": f"https://ntfy.sh/{cfg.ntfy_channel}",
+            "url": f"{base_url}/{cfg.ntfy_channel}",
             "method": "POST",
             "body": f"export:{tech_key}"
         }
@@ -313,13 +297,12 @@ def handle_command(message_text):
         raw_text = message_text.strip()
         lowered = raw_text.lower()
         
-        # Ignoriere automatische Rückmeldungen / Echo-Meldungen
         ignore_markers = [
-            "•", "▶️", "🔄", "🌐", "📊", "📍", "🎛️", "ℹ️", "🚀",
-            "gerät:", "geraet:", "kanal:", "ip-adresse:", "webgui:", 
+            "•", "▶️", "🔄", "🌐", "📊", "📍", "🎛️", "ℹ️", "🚀", "⚙️",
+            "geraet:", "gerät:", "ip-adresse:", "webgui:", 
             "zeitzone:", "zeitsync:", "systemzeit:", "umgebung:", 
-            "letztes update:", "wähle einen kanal", "waehle einen kanal", 
-            "daten-export"
+            "letztes update:", "waehle einen kanal", "wähle einen kanal", 
+            "daten-export", "abschlussbericht", "status: hardware", "status: datenbank"
         ]
         
         if any(marker in lowered for marker in ignore_markers):
@@ -327,12 +310,10 @@ def handle_command(message_text):
 
         print(f"[NtfyControlListener] Verarbeite Input: '{raw_text}'", flush=True)
 
-        # 1. Prüfe auf JSON-Commands
         if raw_text.startswith("{") and raw_text.endswith("}"):
             try:
                 cmd_data = json.loads(raw_text)
                 cmd = cmd_data.get("cmd")
-                
                 if cmd == "sys_info":
                     handle_sys_info()
                     return True
@@ -348,10 +329,9 @@ def handle_command(message_text):
             except json.JSONDecodeError:
                 pass
 
-        # 2. Textbefehle
         text = raw_text.lower()
 
-        if text in ["ping", "pong", "start", "status", "hilfe", "help"]:
+        if text in ["ping", "pong", "status", "hilfe", "help"]:
             handle_status_overview()
             return True
 
@@ -367,8 +347,6 @@ def handle_command(message_text):
                     tech_key = tk
                     break
             db.start_channel(tech_key)
-            
-            # Automatische Bestätigungsansicht
             handle_channel_view(tech_key)
             return True
 
@@ -380,8 +358,6 @@ def handle_command(message_text):
                     tech_key = tk
                     break
             db.reset_channel(tech_key)
-            
-            # Automatische Bestätigungsansicht
             handle_channel_view(tech_key)
             return True
 
@@ -399,8 +375,8 @@ def handle_command(message_text):
             conn.commit()
             conn.close()
             
-            msg_ack = f"📊 Export für Kanal **{cfg.get_friendly_channel_name(tech_key)}** wird gestartet..."
-            send_menu_response(f"Export Ausgelöst [{cfg.device_name_friendly}]", msg_ack, [], tags=["outbox_tray"])
+            msg_ack = f"📊 Export fuer Kanal **{cfg.get_friendly_channel_name(tech_key)}** (`{tech_key}`) wird gestartet..."
+            send_menu_response(f"Export Ausgeloest [{cfg.device_name_friendly}]", msg_ack, [], tags=["outbox_tray"])
             return True
 
         elif text in ["sync_time", "timesync", "synctime"]:
@@ -423,12 +399,13 @@ def handle_command(message_text):
 
 def listen_ntfy():
     channel = cfg.ntfy_channel
+    base_url = get_base_url()
     if not channel:
         print("[NtfyControlListener] FEHLER: Kein ntfy_channel in secrets.json gefunden!", flush=True)
         return
         
-    url = f"https://ntfy.sh/{channel}/json"
-    print(f"[NtfyControlListener] Starte interaktiven Stream-Listener auf Kanal: {channel}", flush=True)
+    url = f"{base_url}/{channel}/json"
+    print(f"[NtfyControlListener] Starte Stream-Listener auf: {url}", flush=True)
     
     while True:
         try:
@@ -453,7 +430,7 @@ def listen_ntfy():
         except requests.exceptions.Timeout:
             time.sleep(2)
         except Exception as e:
-            print(f"[NtfyControlListener] Stream-Verbindungsfehler: {e}. Neustart in 10s...", flush=True)
+            print(f"[NtfyControlListener] Verbindungsfehler: {e}. Neustart in 10s...", flush=True)
             time.sleep(10)
 
 
