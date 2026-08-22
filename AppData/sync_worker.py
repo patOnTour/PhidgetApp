@@ -245,11 +245,18 @@ def sync_batch():
 
 if __name__ == "__main__":
     logger.info(f"Phidget Telemetry Sync-Worker gestartet fuer Device: {DEVICE_ID}")
+    last_cleanup = 0
     
     while True:
         try:
             sync_batch()
             process_pending_commands()
+            
+            # Alle 15 Minuten lückenlos aufräumen
+            if time.time() - last_cleanup > 900:
+                db.run_housekeeping()
+                last_cleanup = time.time()
+                
         except Exception as e:
             logger.error(f"Unerwarteter Fehler im Sync-Loop: {e}")
         time.sleep(SYNC_INTERVAL)

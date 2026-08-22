@@ -230,17 +230,30 @@ class TelemetryDB:
             logger.error(f"Fehler beim Lesen der Kanal-Zustaende: {e}")
         return states
 
-    def run_housekeeping(self, max_age_hours=24):
+    def run_housekeeping(self, max_age_hours=2):
+        """Löscht bereits synchronisierte Daten und begrenzt die DB-Größe strikt."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cutoff = time.time() - (max_age_hours * 3600)
-            cursor.execute("DELETE FROM telemetry WHERE timestamp < ?", (cutoff,))
-            deleted = cursor.rowcount
+            
+            # 1. Alle erfolgreich synchronisierten Daten löschen, die älter als 30 Minuten sind
+            cutoff_synced = time.time() - 1800  # 30 Minuten
+            cursor.execute("DELETE FROM telemetry WHERE synced = 1 AND timestamp < ?", (cutoff_synced,))
+            deleted_synced = cursor.rowcount
+
+            # 2. Sicherheitsnetz: Unsynced Daten erst nach 12 Stunden löschen (falls Offline-Betrieb)
+            cutoff_all = time.time() - (12 * 3600)
+            cursor.execute("DELETE FROM telemetry WHERE timestamp < ?", (cutoff_all,))
+            
             conn.commit()
+
+            # 3. Datenbank physisch auf der SD-Karte verkleinern
+            if deleted_synced > 500:
+                cursor.execute("VACUUM;")
+                
             conn.close()
-            if deleted > 0:
-                logger.info(f"[Housekeeping] {deleted} alte Telemetrie-Zeilen (>24h) aus DB geloescht.")
+            if deleted_synced > 0:
+                logger.info(f"[Housekeeping] {deleted_synced} synchronisierte Zeilen gelöscht & DB optimiert.")
         except Exception as e:
             logger.error(f"Fehler bei Housekeeping: {e}")
 
