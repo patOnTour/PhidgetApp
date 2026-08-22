@@ -1,0 +1,20 @@
+{
+    "device_name": "ccssite01",
+    "systemd_service": "phidget-app.service",
+    "phidget_serial": 625458,
+    "temp_delta_min": 0.6,
+    "temp_delta_max": 1.0,
+    "interval_minutes": 2,
+    "sensors": [
+        {
+            "port": 4,
+            "sensor_type": "tc_4port",
+            "telemetry_key": "Temp"
+        },
+        {
+            "port": 5,
+            "sensor_type": "humidity_temp",
+            "telemetry_key": "Umgebung"
+        }
+    ]
+}
