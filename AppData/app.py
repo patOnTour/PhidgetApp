@@ -3,42 +3,46 @@
 
 """
 Modul: app.py
-Beschreibung: Schlanker Hauptdienst fuer Phidget-Messeinheiten.
-Abtastung, dynamische Drosselung (STOPPED: 20s / RUNNING: 1s), ntfy-Integration.
+Beschreibung: Robuste, dynamische Haupt-Messschleife fuer Phidget-Messeinheiten.
+              - Kontinuierliche Telemetrie (Standby: 5.0s, Messung: 1.0s)
+              - Dynamische Sensor- und Kanalerkennung via ConfigLoader
+              - Nicht-blockierender Betrieb & lokales Logging in SQLite
+Version: 4.0.0 (Dynamic Channel Mapping & Continuous Telemetry Heartbeat)
 """
 
-import time
 import os
-import json
-import logging
+import sys
+import time
 import socket
-import threading
-import sqlite3
-import datetime
-from Phidget22.Devices.TemperatureSensor import TemperatureSensor
-from Phidget22.Devices.HumiditySensor import HumiditySensor
-from Phidget22.PhidgetException import PhidgetException
+import logging
+from datetime import datetime
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
+for p in [current_dir, parent_dir]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from config_loader import ConfigLoader
+from telemetry_db import TelemetryDB
+from phidget_reader import PhidgetReader
+from lcd_manager import PhidgetLCDController
 import notifier
 import ntfy_control_listener
 
-CONFIG_DIR = "/usr/userapps/PhidgetProject/config"
-CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-DB_PATH = "/usr/userapps/PhidgetProject/AppData/telemetry_buffer.db"
-LOG_PATH = "/usr/userapps/PhidgetProject/AppData/logs/app.log"
-
+LOG_PATH = os.path.join(current_dir, "logs", "app.log")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-logging.basicConfig(
-    filename=LOG_PATH,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
 
-app_state = {
-    "status": "STOPPED",
-    "device_name": "ccssite01",
-    "serial": 0,
-    "sensors": []
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [App] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("App")
+
 
 def get_local_ip():
     try:
@@ -50,64 +54,136 @@ def get_local_ip():
     except Exception:
         return "127.0.0.1"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS telemetry (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            device_name TEXT,
-            status TEXT,
-            data JSON,
-            synced INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                app_state["device_name"] = cfg.get("device_name", "ccssite01")
-                app_state["serial"] = cfg.get("phidget_serial", 0)
-                app_state["sensors"] = cfg.get("sensors", [])
-        except Exception as e:
-            logging.error(f"Fehler beim Laden der Config: {e}")
-
-def handle_remote_command(cmd):
-    logging.info(f"Steuerbefehl ausgefuehrt: {cmd}")
+def handle_remote_command(cmd, db: TelemetryDB, config: ConfigLoader):
+    logger.info(f"Remote-Steuerbefehl empfangen: {cmd}")
+    channels = config.get_temperature_channels()
+    
     if cmd == "START":
-        app_state["status"] = "RUNNING"
-    elif cmd in ["EXPORT", "RESET"]:
-        app_state["status"] = "STOPPED"
+        for ch in channels:
+            db.start_channel(ch)
+    elif cmd in ["RESET", "STOP"]:
+        for ch in channels:
+            db.reset_channel(ch)
+    elif cmd == "EXPORT":
+        for ch in channels:
+            db.request_export(ch)
+
 
 def main():
-    load_config()
-    init_db()
-    
-    ip = get_local_ip()
-    logging.info(f"Starte Phidget-App fuer Geraet: {app_state['device_name']} (IP: {ip})")
-    
-    # Startup-Push an Admin & Standort senden
-    notifier.send_startup_notification(ip, app_state["device_name"])
-    
-    # ntfy Listener starten
-    ntfy_control_listener.start_ntfy_listener(handle_remote_command)
-    
-    logging.info("Haupt-Messschleife gestartet.")
-    while True:
+    cfg = ConfigLoader()
+    db = TelemetryDB(os.path.join(current_dir, "telemetry_buffer.db"))
+
+    device_name = cfg.device_name_technical
+    local_ip = get_local_ip()
+    logger.info(f"Initialisiere Phidget-App fuer {device_name} ({cfg.device_name_friendly}) an IP: {local_ip}")
+
+    # 1. Benachrichtigung & Remote Listener starten
+    try:
+        notifier.send_startup_notification(local_ip, device_name)
+    except Exception as e:
+        logger.warning(f"Startup-Benachrichtigung fehlgeschlagen: {e}")
+
+    try:
+        ntfy_control_listener.start_ntfy_listener(lambda cmd: handle_remote_command(cmd, db, cfg))
+    except Exception as e:
+        logger.warning(f"ntfy-Listener konnte nicht gestartet werden: {e}")
+
+    # 2. Hardware initialisieren
+    reader = PhidgetReader(cfg.main_config, cfg.phidget_serial)
+    try:
+        reader.setup_sensors()
+    except Exception as e:
+        logger.error(f"Fehler bei Phidget-Sensorinitialisierung: {e}")
+
+    # Optionales LCD initialisieren (Port aus Sensor-Config ermitteln)
+    lcd_port = None
+    for s in cfg.main_config.get("sensors", []):
+        if s.get("sensor_type") == "lcd1100":
+            lcd_port = s.get("port", 2)
+            break
+
+    lcd_ctrl = None
+    if lcd_port is not None:
         try:
-            # Dynamische Drosselung: RUNNING = 1s, STOPPED = 20s
-            sleep_duration = 1.0 if app_state["status"] == "RUNNING" else 20.0
-            
-            # (Messwert-Erfassung und Pufferung)
-            time.sleep(sleep_duration)
+            lcd_ctrl = PhidgetLCDController(port=lcd_port, phidget_serial=cfg.phidget_serial, db_path=db.db_path)
         except Exception as e:
-            logging.error(f"Fehler im Messzyklus: {e}")
-            time.sleep(5)
+            logger.warning(f"LCD Controller konnte nicht gestartet werden: {e}")
+
+    logger.info("Haupt-Messschleife gestartet.")
+    last_housekeeping = time.time()
+
+    while True:
+        cycle_start = time.time()
+
+        try:
+            # 1. Konfiguration & Kanalzustände frisch prüfen
+            cfg = ConfigLoader()
+            channel_states = db.get_channel_states()
+            
+            # Prüfen, ob mindestens ein Temperaturkanal auf RUNN / RUNNING / TRIGGERED steht
+            active_channels = [
+                ch for ch, st in channel_states.items() 
+                if st in ["RUNN", "RUNNING", "TRIGGERED"]
+            ]
+            is_measuring = len(active_channels) > 0
+
+            # 2. Dynamische Abtastrate definieren
+            cycle_target_duration = 1.0 if is_measuring else 5.0
+
+            # 3. Sensordaten abfragen
+            telemetry_data = {}
+            live_temps = {}
+
+            for sensor_obj, stype, key in reader.sensor_map:
+                try:
+                    if stype == "humidity":
+                        val = sensor_obj.getHumidity()
+                        if val is not None:
+                            telemetry_data["humidity"] = round(float(val), 2)
+                    elif stype == "ambient":
+                        val = sensor_obj.getTemperature()
+                        if val is not None:
+                            telemetry_data["ambient"] = round(float(val), 2)
+                    elif stype == "tc":
+                        val = sensor_obj.getTemperature()
+                        if val is not None:
+                            val_float = round(float(val), 2)
+                            live_temps[key] = val_float
+                            # Thermoelement-Werte nur speichern, wenn Kanal aktiv ist (oder als Standby miterfassen)
+                            if is_measuring and key in active_channels:
+                                telemetry_data[key.lower()] = val_float
+                            else:
+                                telemetry_data[key.lower()] = None
+                except Exception:
+                    # Sensorabfrage-Fehler fangen (z.B. Fühler ausgesteckt)
+                    if stype == "tc":
+                        telemetry_data[key.lower()] = None
+
+            # 4. Datensatz in SQLite schreiben (löst Ingest-Heartbeat über sync_worker aus)
+            now_epoch = time.time()
+            db.insert_telemetry(now_epoch, telemetry_data)
+
+            # 5. LCD Display aktualisieren (falls vorhanden)
+            if lcd_ctrl:
+                try:
+                    lcd_ctrl.update_live_fast(live_temps, channel_states=channel_states)
+                except Exception as e:
+                    logger.debug(f"LCD Frame Update Fehler: {e}")
+
+            # 6. Tägliches Housekeeping alle 6 Stunden
+            if now_epoch - last_housekeeping > 21600:
+                db.run_housekeeping(max_age_hours=48)
+                last_housekeeping = now_epoch
+
+        except Exception as e:
+            logger.error(f"Unerwarteter Fehler im Messzyklus: {e}")
+
+        # Präzises Schlafen bis zum nächsten Zyklus
+        elapsed = time.time() - cycle_start
+        sleep_time = max(0.1, cycle_target_duration - elapsed)
+        time.sleep(sleep_time)
+
 
 if __name__ == "__main__":
     main()

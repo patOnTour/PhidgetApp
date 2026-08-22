@@ -28,7 +28,7 @@ if not analyzer_logger.handlers:
     analyzer_logger.addHandler(handler)
 
 class ConcreteSettingAnalyzer:
-    VERSION = "5.4.0"  # 10min-Sink/3min-Steig Wendepunkt & 6h-Tangenten-Fallback
+    VERSION = "5.3.0"
 
     def __init__(self, db_path=None, ema_span=30, reg_window=15):
         self.cfg = ConfigLoader()

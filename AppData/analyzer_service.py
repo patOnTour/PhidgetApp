@@ -38,7 +38,7 @@ logger = logging.getLogger("AnalyzerService")
 
 
 class AnalyzerService:
-    VERSION = "2.1.0"
+    VERSION = "5.3.0"
 
     def __init__(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))

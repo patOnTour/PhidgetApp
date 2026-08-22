@@ -5,7 +5,7 @@ import os
 import json
 
 class ConfigLoader:
-    VERSION = "1.2.0"
+    VERSION = "5.3.0"
         
     def __init__(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))

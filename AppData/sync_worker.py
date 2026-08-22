@@ -4,8 +4,10 @@
 """
 Modul: sync_worker.py
 Beschreibung: Robuster Hintergrund-Synchronisationsdienst fuer Telemetriedaten zum NAS/Server.
-              Mappt technische Spaltennamen 1:1 auf 0-basierte Kanal-IDs (temp0=0 ... temp7=7, ambient=100, humidity=101).
-Version: 2.3.0 (Exaktes 0-basiertes Index-Mapping fuer Server-Dashboard)
+              - 0-basiertes Index-Mapping (temp0=0 ... temp7=7, ambient=100, humidity=101)
+              - Verarbeitet Remote-Befehle aus der Ingest-Response (start_channel, stop_channel, export_channel)
+              - 5s-Sync-Intervall fuer Heartbeat und latenzarme Fernsteuerung
+Version: 2.4.0 (Remote Channel Control via Ingest API Response)
 """
 
 import os
@@ -30,11 +32,12 @@ from telemetry_db import TelemetryDB
 cfg = ConfigLoader()
 DEVICE_ID = cfg.device_name_technical
 DB_PATH = os.path.join(current_dir, "telemetry_buffer.db")
+db = TelemetryDB(DB_PATH)
 
 NAS_ENDPOINT = "https://telemetry.concretum-setting.com/api/v1/telemetry/ingest"
 API_TOKEN = "DeinGeheimerApiToken456!"
 BATCH_SIZE = 100
-SYNC_INTERVAL = 20
+SYNC_INTERVAL = 5.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,15 +47,6 @@ logger = logging.getLogger("SyncWorker")
 
 
 def resolve_channel_index(col_name: str) -> int:
-    """
-    Mappt die Spaltennamen exakt auf die vom Server erwarteten Zahlen:
-    - temp0 -> 0 (Kanal 1)
-    - temp1 -> 1 (Kanal 2)
-    - ...
-    - temp7 -> 7 (Kanal 8)
-    - ambient -> 100
-    - humidity -> 101
-    """
     col = col_name.lower().strip()
     
     if col in ["ambient", "ambient_temp", "umgebung"]:
@@ -85,7 +79,22 @@ def execute_system_command(cmd_id: int, command: str, payload_raw: str):
 
     success = False
     try:
-        if command == "restart_service":
+        if command == "start_channel":
+            channel = payload.get("channel", "Temp0")
+            success = db.start_channel(channel)
+            logger.info(f"[RemoteCommand] Kanal {channel} gestartet: {success}")
+
+        elif command in ["stop_channel", "reset_channel"]:
+            channel = payload.get("channel", "Temp0")
+            success = db.reset_channel(channel)
+            logger.info(f"[RemoteCommand] Kanal {channel} zurueckgesetzt: {success}")
+
+        elif command == "export_channel":
+            channel = payload.get("channel", "Temp0")
+            success = db.request_export(channel)
+            logger.info(f"[RemoteCommand] Export fuer Kanal {channel} angefordert: {success}")
+
+        elif command == "restart_service":
             service_name = payload.get("service", "phidget-app.service")
             res = subprocess.run(["systemctl", "restart", service_name], capture_output=True, text=True, timeout=10)
             success = (res.returncode == 0)
@@ -236,7 +245,6 @@ def sync_batch():
 
 if __name__ == "__main__":
     logger.info(f"Phidget Telemetry Sync-Worker gestartet fuer Device: {DEVICE_ID}")
-    TelemetryDB(DB_PATH)
     
     while True:
         try:
