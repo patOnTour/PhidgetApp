@@ -36,21 +36,19 @@ class Phidget10HzReader:
             return yaml.safe_load(f)
 
     def _init_ram_db(self):
-        conn = sqlite3.connect(RAM_DB_PATH, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS telemetry_buffer (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp_utc REAL NOT NULL,
-                channel_idx INT NOT NULL,
-                temperature REAL NOT NULL,
-                synced INTEGER DEFAULT 0
-            );
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_synced_id ON telemetry_buffer(synced, id);")
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS telemetry_buffer (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc REAL NOT NULL,
+                    channel_idx INT NOT NULL,
+                    temperature REAL NOT NULL,
+                    synced INTEGER DEFAULT 0
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_synced_id ON telemetry_buffer(synced, id);")
 
     def setup_hardware(self):
         serial = self.config["device"]["phidget_serial"]
@@ -98,13 +96,13 @@ class Phidget10HzReader:
         logger.info(f"{len(self.active_sensors)} Phidget-Kanäle lokal gebunden.")
 
     def run_loop(self):
-        logger.info("10Hz Oversampling Loop gestartet...")
+        logger.info("1Hz Sampling Loop (10Hz Oversampling) gestartet...")
         
         while self.running:
             sec_start = time.time()
             samples = {}
             
-            # 10 Samples in 1 Sekunde erfassen (10 Hz)
+            # 10 Samples innerhalb von 1 Sekunde erfassen
             for _ in range(10):
                 sample_start = time.time()
                 for sensor, stype, ch_idx in self.sensor_map:
@@ -116,10 +114,10 @@ class Phidget10HzReader:
                         pass
                 
                 elapsed = time.time() - sample_start
-                time.sleep(max(0.01, 0.1 - elapsed))
+                time.sleep(max(0.001, 0.1 - elapsed))
 
-            # 1Hz Mittelwert bilden & in RAM-DB schreiben
-            utc_now = time.time()
+            # Exakte UTC-Sekunde bilden
+            utc_now = int(time.time())
             db_records = []
             
             for ch_idx, vals in samples.items():
@@ -129,16 +127,15 @@ class Phidget10HzReader:
 
             if db_records:
                 try:
-                    conn = sqlite3.connect(RAM_DB_PATH, timeout=2.0)
-                    conn.executemany(
-                        "INSERT INTO telemetry_buffer (timestamp_utc, channel_idx, temperature, synced) VALUES (?, ?, ?, ?)",
-                        db_records
-                    )
-                    conn.commit()
-                    conn.close()
+                    with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO telemetry_buffer (timestamp_utc, channel_idx, temperature, synced) VALUES (?, ?, ?, ?)",
+                            db_records
+                        )
                 except Exception as e:
                     logger.error(f"Fehler beim Schreiben in RAM-DB: {e}")
 
+            # Auf die volle Sekunde auffüllen
             sec_elapsed = time.time() - sec_start
             time.sleep(max(0.01, 1.0 - sec_elapsed))
 
