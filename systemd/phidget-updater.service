@@ -1,0 +1,21 @@
+# @file: phidget-updater.service
+# @version: 1.0.0
+# @date: 2026-08-25
+# @description: Systemd Service fuer den automatischen Git-Updater und Daemon-Manager auf Phidget Edge-Geraeten.
+# @author: Patrick Staehli
+
+[Unit]
+Description=Phidget Git Auto-Updater and Daemon Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_updater.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
