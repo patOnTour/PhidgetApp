@@ -1,0 +1,762 @@
+================================================================================
+PROJEKT-VERZEICHNISSTRUKTUR
+================================================================================
+/usr/userapps/PhidgetProject/
+    ├── .gitignore
+    ├── AppData/
+        ├── phidget_netmon.py
+        ├── phidget_reader.py
+        ├── phidget_web.py
+        ├── sync_worker.py
+    ├── config/
+        ├── config.example.yaml
+        ├── config.yaml
+    ├── systemd/
+        ├── phidget-netmon.service
+        ├── phidget-reader.service
+        ├── phidget-sync.service
+        ├── phidget-web.service
+
+
+================================================================================
+DATEINHALTE
+================================================================================
+
+================================================================================
+Datei: .gitignore
+================================================================================
+# Sensible Konfiguration (niemals committen!)
+config/config.yaml
+
+# Temporäre Daten & RAM-Disk
+*.db
+*.db-wal
+*.db-shm
+/tmp/*
+
+# Logs & Python Cache
+*.log
+__pycache__/
+*.pyc
+
+
+================================================================================
+Datei: AppData/phidget_netmon.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import yaml
+import socket
+import logging
+import subprocess
+import requests
+
+BASE_DIR = "/usr/userapps/PhidgetProject"
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [NetMon] %(message)s")
+logger = logging.getLogger("NetMon")
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def get_ip_address():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "Keine IP (Offline)"
+
+def check_ping(target):
+    try:
+        res = subprocess.run(["ping", "-c", "1", "-W", "3", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def send_ntfy_boot():
+    cfg = load_config()
+    ntfy_url = cfg.get("ntfy", {}).get("server_url", "https://ntfy.sh")
+    channel = cfg.get("ntfy", {}).get("admin_channel", "Admin")
+    device_name = cfg.get("device", {}).get("friendly_name", "PhidgetBox")
+    
+    ip = get_ip_address()
+    full_url = f"{ntfy_url.rstrip('/')}/{channel}"
+
+    try:
+        requests.post(
+            full_url,
+            data=f"🚀 {device_name} erfolgreich gestartet!\nIP: {ip}\nStatus: Online".encode("utf-8"),
+            headers={
+                "Title": f"Boot Up: {device_name}",
+                "Tags": "rocket,computer"
+            },
+            timeout=5.0
+        )
+        logger.info(f"ntfy-Bootbenachrichtigung gesendet an {channel}")
+    except Exception as e:
+        logger.warning(f"ntfy-Bootbenachrichtigung fehlgeschlagen: {e}")
+
+def reset_wifi_interface():
+    logger.warning("WLAN-Verbindung unterbrochen! Starte NetworkManager/wpa_supplicant neu...")
+    try:
+        subprocess.run(["systemctl", "restart", "wpa_supplicant"], check=False)
+        subprocess.run(["ifconfig", "wlan0", "down"], check=False)
+        time.sleep(2)
+        subprocess.run(["ifconfig", "wlan0", "up"], check=False)
+    except Exception as e:
+        logger.error(f"Fehler beim WLAN-Reset: {e}")
+
+def netmon_loop():
+    cfg = load_config()
+    ping_target = cfg.get("network", {}).get("ping_target", "1.1.1.1")
+    check_interval = cfg.get("network", {}).get("check_interval_sec", 15)
+    fallback_min = cfg.get("network", {}).get("hotspot_fallback_min", 5)
+
+    send_ntfy_boot()
+
+    offline_seconds = 0
+    hotspot_active = False
+
+    logger.info(f"NetMon Überwachung gestartet (Ping-Ziel: {ping_target})")
+
+    while True:
+        is_online = check_ping(ping_target)
+
+        if is_online:
+            if offline_seconds > 0:
+                logger.info("Internetverbindung wiederhergestellt!")
+            offline_seconds = 0
+            if hotspot_active:
+                logger.info("Deaktiviere Notfall-Hotspot...")
+                subprocess.run(["systemctl", "stop", "hostapd"], check=False)
+                hotspot_active = False
+        else:
+            offline_seconds += check_interval
+            logger.warning(f"Ping fehlgeschlagen. Offline seit {offline_seconds}s")
+
+            # Stufe 1: Sanfter WLAN-Reset nach 45s
+            if offline_seconds == 45:
+                reset_wifi_interface()
+
+            # Stufe 2: Notfall-Hotspot aktivieren nach N Minuten
+            if offline_seconds >= (fallback_min * 60) and not hotspot_active:
+                logger.error(f"Seit {fallback_min} Min offline. Starte Notfall-Hotspot (hostapd)...")
+                subprocess.run(["systemctl", "start", "hostapd"], check=False)
+                hotspot_active = True
+
+        time.sleep(check_interval)
+
+if __name__ == "__main__":
+    netmon_loop()
+
+
+================================================================================
+Datei: AppData/phidget_reader.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import yaml
+import sqlite3
+import logging
+import signal
+import numpy as np
+
+from Phidget22.Devices.TemperatureSensor import TemperatureSensor
+from Phidget22.Devices.HumiditySensor import HumiditySensor
+
+BASE_DIR = "/usr/userapps/PhidgetProject"
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
+RAM_DB_PATH = "/tmp/telemetry.db"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [10Hz-Reader] %(message)s")
+logger = logging.getLogger("Reader")
+
+class Phidget10HzReader:
+    def __init__(self):
+        self.config = self._load_config()
+        self.active_sensors = []
+        self.sensor_map = []  # Tuples: (sensor_obj, sensor_type, channel_idx)
+        self.running = True
+        
+        self._init_ram_db()
+        signal.signal(signal.SIGTERM, self.shutdown)
+        signal.signal(signal.SIGINT, self.shutdown)
+
+    def _load_config(self):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    def _init_ram_db(self):
+        with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS telemetry_buffer (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc REAL NOT NULL,
+                    channel_idx INT NOT NULL,
+                    temperature REAL NOT NULL,
+                    synced INTEGER DEFAULT 0
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_synced_id ON telemetry_buffer(synced, id);")
+
+    def setup_hardware(self):
+        serial = self.config["device"]["phidget_serial"]
+        
+        for s_conf in self.config.get("sensors", []):
+            port = s_conf.get("port")
+            stype = s_conf.get("type")
+            
+            if stype == "humidity_temp":
+                try:
+                    hum = HumiditySensor()
+                    hum.setIsLocal(True)
+                    hum.setHubPort(port)
+                    hum.setDeviceSerialNumber(serial)
+                    hum.openWaitForAttachment(3000)
+                    self.active_sensors.append(hum)
+                    self.sensor_map.append((hum, "humidity", 101))
+
+                    amb = TemperatureSensor()
+                    amb.setIsLocal(True)
+                    amb.setHubPort(port)
+                    amb.setDeviceSerialNumber(serial)
+                    amb.openWaitForAttachment(3000)
+                    self.active_sensors.append(amb)
+                    self.sensor_map.append((amb, "ambient", 100))
+                except Exception as ex:
+                    logger.error(f"Fehler bei Port {port} (Humidity/Ambient): {ex}")
+
+            elif stype == "tc_4port":
+                for ch in range(4):
+                    try:
+                        tc = TemperatureSensor()
+                        tc.setIsLocal(True)
+                        tc.setHubPort(port)
+                        tc.setChannel(ch)
+                        tc.setDeviceSerialNumber(serial)
+                        tc.openWaitForAttachment(3000)
+                        self.active_sensors.append(tc)
+                        
+                        channel_idx = len([s for s in self.sensor_map if s[1] == "tc"])
+                        self.sensor_map.append((tc, "tc", channel_idx))
+                    except Exception as ex:
+                        logger.error(f"Fehler bei Port {port} Ch {ch} (Thermo): {ex}")
+
+        logger.info(f"{len(self.active_sensors)} Phidget-Kanäle lokal gebunden.")
+
+    def run_loop(self):
+        logger.info("1Hz Sampling Loop (10Hz Oversampling) gestartet...")
+        
+        while self.running:
+            sec_start = time.time()
+            samples = {}
+            
+            # 10 Samples innerhalb von 1 Sekunde erfassen
+            for _ in range(10):
+                sample_start = time.time()
+                for sensor, stype, ch_idx in self.sensor_map:
+                    try:
+                        val = sensor.getHumidity() if stype == "humidity" else sensor.getTemperature()
+                        if val is not None:
+                            samples.setdefault(ch_idx, []).append(float(val))
+                    except Exception:
+                        pass
+                
+                elapsed = time.time() - sample_start
+                time.sleep(max(0.001, 0.1 - elapsed))
+
+            # Exakte UTC-Sekunde bilden
+            utc_now = int(time.time())
+            db_records = []
+            
+            for ch_idx, vals in samples.items():
+                if vals:
+                    avg_val = round(float(np.mean(vals)), 2)
+                    db_records.append((utc_now, ch_idx, avg_val, 0))
+
+            if db_records:
+                try:
+                    with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO telemetry_buffer (timestamp_utc, channel_idx, temperature, synced) VALUES (?, ?, ?, ?)",
+                            db_records
+                        )
+                except Exception as e:
+                    logger.error(f"Fehler beim Schreiben in RAM-DB: {e}")
+
+            # Auf die volle Sekunde auffüllen
+            sec_elapsed = time.time() - sec_start
+            time.sleep(max(0.01, 1.0 - sec_elapsed))
+
+    def shutdown(self, signum, frame):
+        logger.info("Schließe Phidget-Hardware...")
+        self.running = False
+        for s in self.active_sensors:
+            try:
+                s.close()
+            except Exception:
+                pass
+        sys.exit(0)
+
+if __name__ == "__main__":
+    reader = Phidget10HzReader()
+    reader.setup_hardware()
+    reader.run_loop()
+
+================================================================================
+Datei: AppData/phidget_web.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import yaml
+import sqlite3
+import logging
+import threading
+from flask import Flask, jsonify, render_template_string
+
+BASE_DIR = "/usr/userapps/PhidgetProject"
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
+RAM_DB_PATH = "/tmp/telemetry.db"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [WebGUI] %(message)s")
+logger = logging.getLogger("WebGUI")
+
+app = Flask(__name__)
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def get_latest_telemetry():
+    telemetry = {}
+    pending_count = 0
+    try:
+        conn = sqlite3.connect(RAM_DB_PATH, timeout=2.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Pufferstand
+        cursor.execute("SELECT COUNT(*) AS cnt FROM telemetry_buffer WHERE synced = 0;")
+        pending_count = cursor.fetchone()["cnt"]
+
+        # Neueste Werte je Kanal
+        cursor.execute("""
+            SELECT channel_idx, temperature, timestamp_utc 
+            FROM telemetry_buffer 
+            WHERE id IN (SELECT MAX(id) FROM telemetry_buffer GROUP BY channel_idx);
+        """)
+        rows = cursor.fetchall()
+        for r in rows:
+            telemetry[r["channel_idx"]] = {
+                "temp": r["temperature"],
+                "ts": r["timestamp_utc"]
+            }
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB-Abfragefehler im WebGUI: {e}")
+
+    return telemetry, pending_count
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ cfg.device.friendly_name }} - Live Status</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
+        .card { background: #1e1e1e; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        h1 { margin-top: 0; color: #4caf50; font-size: 24px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 15px; }
+        .sensor-box { background: #2a2a2a; border-radius: 8px; padding: 15px; text-align: center; border-left: 4px solid #4caf50; }
+        .sensor-val { font-size: 28px; font-weight: bold; color: #fff; margin: 10px 0 0 0; }
+        .sensor-label { font-size: 14px; color: #aaa; text-transform: uppercase; }
+        .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background: #333; color: #fff; }
+        .badge-pending { background: #ff9800; color: #000; }
+        .badge-ok { background: #4caf50; color: #fff; }
+    </style>
+    <script>
+        async function updateData() {
+            try {
+                const res = await fetch('/api/live');
+                const data = await res.json();
+                document.getElementById('pending-count').innerText = data.pending_count;
+                
+                for (const [ch, val] of Object.entries(data.telemetry)) {
+                    const el = document.getElementById('ch-' + ch);
+                    if (el) el.innerText = val.temp.toFixed(1) + ' °C';
+                }
+            } catch (e) {}
+        }
+        setInterval(updateData, 1000);
+    </script>
+</head>
+<body>
+    <div class="card">
+        <h1>{{ cfg.device.friendly_name }} ({{ cfg.device.device_id }})</h1>
+        <p>Phidget Serial: <strong>{{ cfg.device.phidget_serial }}</strong></p>
+        <p>Pufferstand (Unsynced): <span id="pending-count" class="badge badge-pending">{{ pending_count }}</span> Datensätze</p>
+    </div>
+
+    <div class="card">
+        <h2>Live Messwerte (1 Hz)</h2>
+        <div class="grid">
+            {% for ch, label in channel_labels.items() %}
+            <div class="sensor-box">
+                <div class="sensor-label">{{ label }}</div>
+                <div class="sensor-val" id="ch-{{ ch }}">
+                    {% if ch in telemetry %}{{ "%.1f"|format(telemetry[ch].temp) }} °C{% else %}--.- °C{% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    cfg = load_config()
+    telemetry, pending_count = get_latest_telemetry()
+    
+    channel_labels = {100: "Umgebung", 101: "Luftfeuchte"}
+    for idx in range(8):
+        channel_labels[idx] = f"Temp {idx+1}"
+
+    return render_template_string(
+        HTML_TEMPLATE, 
+        cfg=cfg, 
+        telemetry=telemetry, 
+        pending_count=pending_count,
+        channel_labels=channel_labels
+    )
+
+@app.route("/api/live")
+def api_live():
+    telemetry, pending_count = get_latest_telemetry()
+    return jsonify({
+        "telemetry": telemetry,
+        "pending_count": pending_count,
+        "timestamp_utc": time.time()
+    })
+
+# Optionale LCD1100 Integration (falls ein LCD angeschlossen ist)
+def lcd_worker():
+    cfg = load_config()
+    serial = cfg["device"]["phidget_serial"]
+    lcd_port = None
+
+    for s in cfg.get("sensors", []):
+        if s.get("type") == "lcd1100":
+            lcd_port = s.get("port", 2)
+            break
+
+    if lcd_port is None:
+        logger.info("Kein LCD in config.yaml definiert. LCD-Worker übersprungen.")
+        return
+
+    try:
+        from Phidget22.Devices.LCD import LCD
+        lcd = LCD()
+        lcd.setIsLocal(True)
+        lcd.setHubPort(lcd_port)
+        lcd.setDeviceSerialNumber(serial)
+        lcd.openWaitForAttachment(3000)
+        logger.info(f"LCD1100 an Port {lcd_port} erfolgreich verbunden.")
+
+        while True:
+            telemetry, pending = get_latest_telemetry()
+            
+            # Zeile 1
+            t0 = telemetry.get(0, {}).get("temp", "--.-")
+            t1 = telemetry.get(1, {}).get("temp", "--.-")
+            line1 = f"T1:{t0}C T2:{t1}C" if isinstance(t0, float) else "Phidget Ready"
+            
+            # Zeile 2
+            line2 = f"Buf: {pending} recs"
+            
+            lcd.writeText(0, 0, line1[:16].ljust(16))
+            lcd.writeText(1, 0, line2[:16].ljust(16))
+            lcd.flush()
+            time.sleep(1.0)
+    except Exception as e:
+        logger.warning(f"LCD-Worker nicht gestartet/unterbrochen: {e}")
+
+if __name__ == "__main__":
+    t = threading.Thread(target=lcd_worker, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=8081, debug=False)
+
+
+================================================================================
+Datei: AppData/sync_worker.py
+================================================================================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import yaml
+import sqlite3
+import logging
+import requests
+from datetime import datetime, timezone
+
+BASE_DIR = "/usr/userapps/PhidgetProject"
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
+RAM_DB_PATH = "/tmp/telemetry.db"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [SyncWorker] %(message)s")
+logger = logging.getLogger("SyncWorker")
+
+def load_config():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def sync_loop():
+    cfg = load_config()
+    device_id = cfg["device"]["device_id"]
+    ingest_url = cfg["server"]["ingest_url"]
+    token = cfg["server"]["api_token"]
+    
+    # TURBO: 200 Einträge pro Paket für schnellen Abbau!
+    BATCH_SIZE = 200
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    logger.info(f"SyncWorker gestartet für Device: {device_id}")
+
+    while True:
+        try:
+            conn = sqlite3.connect(RAM_DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Pufferstand ermitteln
+            cursor.execute("SELECT COUNT(*) AS cnt FROM telemetry_buffer WHERE synced = 0;")
+            pending_count = cursor.fetchone()["cnt"]
+
+            # Bis zu 200 älteste Einträge holen
+            cursor.execute("""
+                SELECT id, timestamp_utc, channel_idx, temperature 
+                FROM telemetry_buffer 
+                WHERE synced = 0 
+                ORDER BY id ASC 
+                LIMIT ?;
+            """, (BATCH_SIZE,))
+            rows = cursor.fetchall()
+
+            if rows:
+                records = []
+                max_id = rows[-1]["id"]  # Höchste ID des aktuellen Batches
+
+                for r in rows:
+                    dt_iso = datetime.fromtimestamp(r["timestamp_utc"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    records.append({
+                        "timestamp": dt_iso,
+                        "channel": int(r["channel_idx"]),
+                        "temperature": float(r["temperature"]),
+                        "job_id": f"temp{r['channel_idx']}" if r["channel_idx"] < 100 else ("ambient" if r["channel_idx"] == 100 else "humidity")
+                    })
+
+                payload = {
+                    "device_id": device_id,
+                    "records": records
+                }
+
+                batch_headers = dict(headers)
+                batch_headers["X-Pending-Count"] = str(pending_count)
+
+                res = requests.post(ingest_url, json=payload, headers=batch_headers, timeout=5.0)
+
+                if res.status_code == 200:
+                    # LÖSCHEN PER MAX_ID: Extrem schnell & verhindert SQLite-Locks
+                    cursor.execute("DELETE FROM telemetry_buffer WHERE id <= ?;", (max_id,))
+                    conn.commit()
+                    conn.close()
+
+                    # CATCH-UP-LOGIK: Puffer war voll -> Sofort weiter ohne Pause!
+                    if len(rows) == BATCH_SIZE:
+                        continue 
+
+            conn.close()
+
+        except requests.exceptions.RequestException:
+            logger.debug("Server nicht erreichbar (Offline-Puffer aktiv).")
+        except Exception as e:
+            logger.error(f"Fehler im Sync-Worker: {e}")
+
+        # Normalbetrieb: Wenn Puffer abgearbeitet ist, 1 Sekunde warten
+        time.sleep(1.0)
+
+if __name__ == "__main__":
+    sync_loop()
+
+================================================================================
+Datei: config/config.example.yaml
+================================================================================
+device:
+  device_id: "ccssite01"
+  friendly_name: "Baustellenkoffer 1"
+  phidget_serial: 123456
+
+server:
+  ingest_url: "https://telemetry.example.com/api/v1/telemetry/ingest"
+  api_token: "DEIN_API_TOKEN_HIER"
+  batch_size: 10
+  sync_interval_sec: 5.0
+
+ntfy:
+  server_url: "https://ntfy.sh"
+  location_channel: "mein_ort_channel"
+  admin_channel: "mein_admin_channel"
+
+network:
+  ping_target: "1.1.1.1"
+  check_interval_sec: 15
+  hotspot_fallback_min: 5
+
+sensors:
+  - port: 0
+    type: "humidity_temp"
+    label: "Umgebung"
+  - port: 1
+    type: "tc_4port"
+    label: "Temp"
+
+
+================================================================================
+Datei: config/config.yaml
+================================================================================
+device:
+  device_id: "ccssite01"
+  friendly_name: "Baustellenkoffer 1"
+  phidget_serial: 625458
+
+server:
+  ingest_url: "https://telemetry.example.com/api/v1/telemetry/ingest"
+  api_token: "DeinGeheimerApiToken456!"
+  batch_size: 10
+  sync_interval_sec: 5.0
+
+ntfy:
+  server_url: "https://ntfy.concretum-setting.com"
+  location_channel: "Concretum"
+  admin_channel: "Admin"
+
+network:
+  ping_target: "1.1.1.1"
+  check_interval_sec: 15
+  hotspot_fallback_min: 5
+
+sensors:
+  - port: 0
+    type: "humidity_temp"
+    label: "Umgebung"
+  - port: 1
+    type: "tc_4port"
+    label: "Temp"
+
+
+================================================================================
+Datei: systemd/phidget-netmon.service
+================================================================================
+[Unit]
+Description=Phidget Network Monitor, Boot Notification & WiFi Recovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_netmon.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+
+================================================================================
+Datei: systemd/phidget-reader.service
+================================================================================
+[Unit]
+Description=Phidget 10Hz Oversampling Measurement Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_reader.py
+Restart=always
+RestartSec=3
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=99
+
+[Install]
+WantedBy=multi-user.target
+
+
+================================================================================
+Datei: systemd/phidget-sync.service
+================================================================================
+[Unit]
+Description=Phidget Telemetry Sync Worker
+After=network.target phidget-reader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/sync_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
+================================================================================
+Datei: systemd/phidget-web.service
+================================================================================
+[Unit]
+Description=Phidget WebGUI and LCD Controller Service
+After=network.target phidget-reader.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/userapps/PhidgetProject/AppData
+ExecStart=/usr/bin/python3 /usr/userapps/PhidgetProject/AppData/phidget_web.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+

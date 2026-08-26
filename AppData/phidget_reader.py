@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+@file: phidget_reader.py
+@version: 1.3.0
+@date: 2026-08-26
+@description: 1Hz Sampling mit 10Hz Oversampling, 5%-95% Perzentil-Trimming, Median-Filter, dynamischem Sprungschutz (+-2.5 Grad C) und SQLite-RAM-Buffer (DEV-12).
+@author: Patrick Staehli
+"""
 
 import os
 import sys
@@ -20,12 +25,14 @@ RAM_DB_PATH = "/tmp/telemetry.db"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [10Hz-Reader] %(message)s")
 logger = logging.getLogger("Reader")
 
+
 class Phidget10HzReader:
     def __init__(self):
         self.config = self._load_config()
         self.active_sensors = []
         self.sensor_map = []  # Tuples: (sensor_obj, sensor_type, channel_idx)
         self.running = True
+        self._last_values = {}
         
         self._init_ram_db()
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -93,7 +100,7 @@ class Phidget10HzReader:
                     except Exception as ex:
                         logger.error(f"Fehler bei Port {port} Ch {ch} (Thermo): {ex}")
 
-        logger.info(f"{len(self.active_sensors)} Phidget-Kanäle lokal gebunden.")
+        logger.info(f"{len(self.active_sensors)} Phidget-Kanaele lokal gebunden.")
 
     def run_loop(self):
         logger.info("1Hz Sampling Loop (10Hz Oversampling) gestartet...")
@@ -122,8 +129,29 @@ class Phidget10HzReader:
             
             for ch_idx, vals in samples.items():
                 if vals:
-                    avg_val = round(float(np.mean(vals)), 2)
-                    db_records.append((utc_now, ch_idx, avg_val, 0))
+                    arr = np.array(vals, dtype=float)
+                    # 1. 5%-95% Perzentil-Trimming
+                    p5 = np.percentile(arr, 5)
+                    p95 = np.percentile(arr, 95)
+                    trimmed = arr[(arr >= p5) & (arr <= p95)]
+                    if len(trimmed) == 0:
+                        trimmed = arr
+                    
+                    # 2. Median-Filter
+                    median_val = float(np.median(trimmed))
+                    
+                    # 3. Dynamischer Sprungschutz (max. +-2.5 Grad C pro Sekunde)
+                    if ch_idx in self._last_values:
+                        last_val = self._last_values[ch_idx]
+                        max_delta = 2.5
+                        if abs(median_val - last_val) > max_delta:
+                            median_val = last_val + max_delta if median_val > last_val else last_val - max_delta
+                    
+                    self._last_values[ch_idx] = median_val
+                    
+                    # 4. In Puffer einfuegen
+                    filtered_val = round(median_val, 2)
+                    db_records.append((utc_now, ch_idx, filtered_val, 0))
 
             if db_records:
                 try:
@@ -135,12 +163,12 @@ class Phidget10HzReader:
                 except Exception as e:
                     logger.error(f"Fehler beim Schreiben in RAM-DB: {e}")
 
-            # Auf die volle Sekunde auffüllen
+            # Auf die volle Sekunde auffuellen
             sec_elapsed = time.time() - sec_start
             time.sleep(max(0.01, 1.0 - sec_elapsed))
 
     def shutdown(self, signum, frame):
-        logger.info("Schließe Phidget-Hardware...")
+        logger.info("Schliesse Phidget-Hardware...")
         self.running = False
         for s in self.active_sensors:
             try:
@@ -148,6 +176,7 @@ class Phidget10HzReader:
             except Exception:
                 pass
         sys.exit(0)
+
 
 if __name__ == "__main__":
     reader = Phidget10HzReader()
