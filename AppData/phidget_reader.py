@@ -1,9 +1,9 @@
 """
 @file: phidget_reader.py
-@version: 1.4.0
+@version: 1.5.0
 @date: 2026-08-27
-@description: 1Hz Sampling mit 10Hz Oversampling, Perzentil-Trimming (5%-95%), 
-              Median-Filter, dynamischem Sprungschutz und rekursivem EMA-Filter (Alpha=0.20) zur Rauschunterdrückung.
+@description: 20s-Bucket-Sampling mit 10Hz Oversampling (200 Samples/Block), 
+              Perzentil-Trimming (5%-95%), Median-Filter und EMA-Glättung.
 @author: Patrick Staehli
 """
 
@@ -105,17 +105,16 @@ class Phidget10HzReader:
         logger.info(f"{len(self.active_sensors)} Phidget-Kanaele lokal gebunden.")
 
     def run_loop(self):
-        logger.info("1Hz Sampling Loop (10Hz Oversampling + EMA Filter) gestartet...")
-        
-        # Filter-Koeffizient (Alpha): 0.20 = weiche Glättung ohne Reaktionsverzögerung
-        EMA_ALPHA = 0.20
-        
+        logger.info("20s-Sampling Loop (10Hz Oversampling + 20s Median/EMA) gestartet...")
+        EMA_ALPHA = 0.30
+        INTERVAL_SEC = 20  # 20-Sekunden-Takt
+
         while self.running:
-            sec_start = time.time()
+            loop_start = time.time()
             samples = {}
-            
-            # 10 Samples innerhalb von 1 Sekunde erfassen
-            for _ in range(10):
+
+            # 20 Sekunden lang im 100ms-Takt erfassen (ca. 200 Samples pro Kanal)
+            while (time.time() - loop_start) < INTERVAL_SEC and self.running:
                 sample_start = time.time()
                 for sensor, stype, ch_idx in self.sensor_map:
                     try:
@@ -124,44 +123,44 @@ class Phidget10HzReader:
                             samples.setdefault(ch_idx, []).append(float(val))
                     except Exception:
                         pass
-                
-                elapsed = time.time() - sample_start
-                time.sleep(max(0.001, 0.1 - elapsed))
 
-            # Exakte UTC-Sekunde bilden
+                elapsed = time.time() - sample_start
+                time.sleep(max(0.001, 0.10 - elapsed))
+
+            if not self.running:
+                break
+
             utc_now = int(time.time())
             db_records = []
-            
+
             for ch_idx, vals in samples.items():
                 if vals:
                     arr = np.array(vals, dtype=float)
-                    
-                    # 1. 5%-95% Perzentil-Trimming gegen grobe EMV-Peaks
+
+                    # 1. 5%-95% Perzentil-Trimming
                     p5 = np.percentile(arr, 5)
                     p95 = np.percentile(arr, 95)
                     trimmed = arr[(arr >= p5) & (arr <= p95)]
                     if len(trimmed) == 0:
                         trimmed = arr
-                    
-                    # 2. Median über das bereinigte 10er-Paket
+
+                    # 2. Median über die bereinigten Samples
                     current_val = float(np.median(trimmed))
-                    
-                    # 3. Dynamischer Sprungschutz (max. +-2.5 °C pro Sekunde)
+
+                    # 3. Dynamischer Sprungschutz (max +-3.0 °C pro 20s)
                     if ch_idx in self._last_values:
                         last_val = self._last_values[ch_idx]
-                        max_delta = 2.5
+                        max_delta = 3.0
                         if abs(current_val - last_val) > max_delta:
                             current_val = last_val + max_delta if current_val > last_val else last_val - max_delta
                     self._last_values[ch_idx] = current_val
 
-                    # 4. Rekursiver EMA-Tiefpassfilter (Glättet Quantisierungsrauschen)
+                    # 4. Rekursiver EMA-Filter
                     if ch_idx not in self._ema_values:
-                        # Initialisierung beim ersten Wert
                         self._ema_values[ch_idx] = current_val
                     else:
                         self._ema_values[ch_idx] = (EMA_ALPHA * current_val) + ((1.0 - EMA_ALPHA) * self._ema_values[ch_idx])
-                    
-                    # 5. Wert runden und in DB-Puffer packen
+
                     filtered_val = round(self._ema_values[ch_idx], 2)
                     db_records.append((utc_now, ch_idx, filtered_val, 0))
 
@@ -174,10 +173,6 @@ class Phidget10HzReader:
                         )
                 except Exception as e:
                     logger.error(f"Fehler beim Schreiben in RAM-DB: {e}")
-
-            # Auf die volle Sekunde auffuellen
-            sec_elapsed = time.time() - sec_start
-            time.sleep(max(0.01, 1.0 - sec_elapsed))
 
     def shutdown(self, signum, frame):
         logger.info("Schliesse Phidget-Hardware...")
