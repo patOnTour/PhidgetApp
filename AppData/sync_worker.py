@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+@file: sync_worker.py
+@version: 1.4.2
+@date: 2026-08-27
+@description: Finaler Sync-Worker mit korrekten job_ids (temp0-temp3) für das Dashboard.
+@author: Patrick Stähli
+"""
+
 import os
 import time
 import yaml
@@ -26,7 +34,6 @@ def sync_loop():
     ingest_url = cfg["server"]["ingest_url"]
     token = cfg["server"]["api_token"]
     
-    # 200 Datensätze pro Sendevorgang
     BATCH_SIZE = 200
 
     headers = {
@@ -41,7 +48,6 @@ def sync_loop():
         pending_count = 0
         max_id = None
 
-        # 1. Daten kurz aus SQLite lesen und Verbindung sofort wieder SCHLIESSEN
         try:
             with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
                 conn.row_factory = sqlite3.Row
@@ -65,20 +71,28 @@ def sync_loop():
             time.sleep(2.0)
             continue
 
-        # Wenn keine Daten da sind, kurz pausieren
         if not rows:
             time.sleep(1.0)
             continue
 
-        # 2. JSON Payload aufbauen (1Hz Werte aus 10Hz Oversampling)
         records = []
         for r in rows:
             dt_iso = datetime.fromtimestamp(r["timestamp_utc"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ch_idx = int(r["channel_idx"])
+            
+            # WICHTIG: Dashboard erwartet temp0-temp3 für die Anzeige!
+            if ch_idx < 100:
+                job_id = f"temp{ch_idx}"
+            elif ch_idx == 100:
+                job_id = "ambient"
+            else:
+                job_id = "humidity"
+
             records.append({
                 "timestamp": dt_iso,
-                "channel": int(r["channel_idx"]),
+                "channel": ch_idx,
                 "temperature": float(r["temperature"]),
-                "job_id": f"temp{r['channel_idx']}" if r["channel_idx"] < 100 else ("ambient" if r["channel_idx"] == 100 else "humidity")
+                "job_id": f"temp{ch_idx}" if ch_idx < 100 else ("ambient" if ch_idx == 100 else "humidity")
             })
 
         payload = {
@@ -89,19 +103,16 @@ def sync_loop():
         batch_headers = dict(headers)
         batch_headers["X-Pending-Count"] = str(pending_count)
 
-        # 3. An den Server senden
         try:
             res = requests.post(ingest_url, json=payload, headers=batch_headers, timeout=5.0)
 
             if res.status_code == 200:
-                # 4. Nach Erfolg: Gesendete Daten löschen
                 with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
                     conn.execute("DELETE FROM telemetry_buffer WHERE id <= ?;", (max_id,))
                     conn.commit()
                 
-                logger.info(f"Paket ({len(records)} Werte) gesendet & gelöscht. Restpuffer: {pending_count - len(records)}")
+                logger.info(f"Paket ({len(records)} Werte) gesendet. Restpuffer: {pending_count - len(records)}")
 
-                # Wenn Puffer voll war, sofort weitermachen ohne time.sleep()
                 if len(rows) == BATCH_SIZE:
                     continue
             else:

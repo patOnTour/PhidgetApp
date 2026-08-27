@@ -1,8 +1,9 @@
 """
 @file: phidget_reader.py
-@version: 1.3.0
-@date: 2026-08-26
-@description: 1Hz Sampling mit 10Hz Oversampling, 5%-95% Perzentil-Trimming, Median-Filter, dynamischem Sprungschutz (+-2.5 Grad C) und SQLite-RAM-Buffer (DEV-12).
+@version: 1.4.0
+@date: 2026-08-27
+@description: 1Hz Sampling mit 10Hz Oversampling, Perzentil-Trimming (5%-95%), 
+              Median-Filter, dynamischem Sprungschutz und rekursivem EMA-Filter (Alpha=0.20) zur Rauschunterdrückung.
 @author: Patrick Staehli
 """
 
@@ -33,6 +34,7 @@ class Phidget10HzReader:
         self.sensor_map = []  # Tuples: (sensor_obj, sensor_type, channel_idx)
         self.running = True
         self._last_values = {}
+        self._ema_values = {}  # EMA-Filter Zustand pro Kanal
         
         self._init_ram_db()
         signal.signal(signal.SIGTERM, self.shutdown)
@@ -103,7 +105,10 @@ class Phidget10HzReader:
         logger.info(f"{len(self.active_sensors)} Phidget-Kanaele lokal gebunden.")
 
     def run_loop(self):
-        logger.info("1Hz Sampling Loop (10Hz Oversampling) gestartet...")
+        logger.info("1Hz Sampling Loop (10Hz Oversampling + EMA Filter) gestartet...")
+        
+        # Filter-Koeffizient (Alpha): 0.20 = weiche Glättung ohne Reaktionsverzögerung
+        EMA_ALPHA = 0.20
         
         while self.running:
             sec_start = time.time()
@@ -130,27 +135,34 @@ class Phidget10HzReader:
             for ch_idx, vals in samples.items():
                 if vals:
                     arr = np.array(vals, dtype=float)
-                    # 1. 5%-95% Perzentil-Trimming
+                    
+                    # 1. 5%-95% Perzentil-Trimming gegen grobe EMV-Peaks
                     p5 = np.percentile(arr, 5)
                     p95 = np.percentile(arr, 95)
                     trimmed = arr[(arr >= p5) & (arr <= p95)]
                     if len(trimmed) == 0:
                         trimmed = arr
                     
-                    # 2. Median-Filter
-                    median_val = float(np.median(trimmed))
+                    # 2. Median über das bereinigte 10er-Paket
+                    current_val = float(np.median(trimmed))
                     
-                    # 3. Dynamischer Sprungschutz (max. +-2.5 Grad C pro Sekunde)
+                    # 3. Dynamischer Sprungschutz (max. +-2.5 °C pro Sekunde)
                     if ch_idx in self._last_values:
                         last_val = self._last_values[ch_idx]
                         max_delta = 2.5
-                        if abs(median_val - last_val) > max_delta:
-                            median_val = last_val + max_delta if median_val > last_val else last_val - max_delta
+                        if abs(current_val - last_val) > max_delta:
+                            current_val = last_val + max_delta if current_val > last_val else last_val - max_delta
+                    self._last_values[ch_idx] = current_val
+
+                    # 4. Rekursiver EMA-Tiefpassfilter (Glättet Quantisierungsrauschen)
+                    if ch_idx not in self._ema_values:
+                        # Initialisierung beim ersten Wert
+                        self._ema_values[ch_idx] = current_val
+                    else:
+                        self._ema_values[ch_idx] = (EMA_ALPHA * current_val) + ((1.0 - EMA_ALPHA) * self._ema_values[ch_idx])
                     
-                    self._last_values[ch_idx] = median_val
-                    
-                    # 4. In Puffer einfuegen
-                    filtered_val = round(median_val, 2)
+                    # 5. Wert runden und in DB-Puffer packen
+                    filtered_val = round(self._ema_values[ch_idx], 2)
                     db_records.append((utc_now, ch_idx, filtered_val, 0))
 
             if db_records:
