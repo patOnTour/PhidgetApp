@@ -24,23 +24,45 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [Syn
 logger = logging.getLogger("SyncWorker")
 
 
-def get_git_version():
-    """Liest den aktuellen Git-Tag oder Short-Commit aus dem Projektordner."""
-    try:
-        # Exakten Tag pruefen
-        tag = subprocess.check_output(
-            ["git", "describe", "--tags", "--exact-match"],
-            cwd=BASE_DIR,
-            stderr=subprocess.DEVNULL,
-            text=True
-        ).strip()
-        if tag:
-            return tag
-    except Exception:
-        pass
+"""
+@file: sync_worker.py
+@version: 1.6.2
+@date: 2026-08-29
+@description: Sync-Worker mit Datei-basierter Versionsauslesung (VERSION), SQLite-Pufferung und atomarem Chunk-Delete.
+@author: Patrick Staehli
+"""
+
+import os
+import time
+import yaml
+import sqlite3
+import logging
+import requests
+import subprocess
+from datetime import datetime, timezone
+
+BASE_DIR = "/usr/userapps/PhidgetProject"
+CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "telemetry.db")
+VERSION_FILE = os.path.join(BASE_DIR, "VERSION")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [SyncWorker] %(message)s")
+logger = logging.getLogger("SyncWorker")
+
+
+def get_client_version():
+    """Liest die Versionsnummer aus der Datei VERSION, Fallback auf Short Commit Hash."""
+    if os.path.exists(VERSION_FILE):
+        try:
+            with open(VERSION_FILE, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+        except Exception as e:
+            logger.warning(f"Konnte VERSION-Datei nicht lesen: {e}")
 
     try:
-        # Fallback: Short Commit Hash
         commit = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=BASE_DIR,
@@ -52,10 +74,10 @@ def get_git_version():
     except Exception:
         pass
 
-    return "v1.6.1"
+    return "v1.6.2"
 
 
-CLIENT_VERSION = get_git_version()
+CLIENT_VERSION = get_client_version()
 
 
 def load_config():
