@@ -27,8 +27,9 @@ logger = logging.getLogger("SyncWorker")
 def get_git_version():
     """Liest den aktuellen Git-Tag oder Short-Commit aus dem Projektordner."""
     try:
+        # Exakten Tag pruefen
         tag = subprocess.check_output(
-            ["git", "describe", "--tags", "--always"],
+            ["git", "describe", "--tags", "--exact-match"],
             cwd=BASE_DIR,
             stderr=subprocess.DEVNULL,
             text=True
@@ -37,6 +38,20 @@ def get_git_version():
             return tag
     except Exception:
         pass
+
+    try:
+        # Fallback: Short Commit Hash
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=BASE_DIR,
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        if commit:
+            return f"rev-{commit}"
+    except Exception:
+        pass
+
     return "v1.6.1"
 
 
