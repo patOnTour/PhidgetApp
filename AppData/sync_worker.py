@@ -1,8 +1,8 @@
 """
 @file: sync_worker.py
-@version: 1.5.0
+@version: 1.6.0
 @date: 2026-08-29
-@description: Sync-Worker fuer persistente SQLite-Pufferung mit Dashboard-konformen job_ids (temp0-temp7, ambient, humidity) und atomarem Chunk-Delete.
+@description: Sync-Worker fuer persistente SQLite-Pufferung mit Dashboard-konformen job_ids (temp0-temp7, ambient, humidity), atomarem Chunk-Delete und X-Client-Version Header.
 @author: Patrick Staehli
 """
 
@@ -13,6 +13,8 @@ import sqlite3
 import logging
 import requests
 from datetime import datetime, timezone
+
+CLIENT_VERSION = "v1.6.0"
 
 BASE_DIR = "/usr/userapps/PhidgetProject"
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
@@ -48,10 +50,11 @@ def sync_loop():
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-Client-Version": CLIENT_VERSION
     }
 
-    logger.info(f"SyncWorker gestartet fuer Device: {device_id} -> {ingest_url}")
+    logger.info(f"SyncWorker gestartet fuer Device: {device_id} (Version: {CLIENT_VERSION}) -> {ingest_url}")
 
     while True:
         if not os.path.exists(DB_PATH):

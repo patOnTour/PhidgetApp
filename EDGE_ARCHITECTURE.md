@@ -1,5 +1,8 @@
 # EDGE ARCHITECTURE & DEPENDENCIES (Phidget SBC4 / Baustellenkoffer)
 
+## 0 Global
+- **User auf den Esge Geräten:** auf den Edge Geräten bin ich als root angemeldet und brauche kein sudo in der bash Zeile
+
 ## 1. Übersicht & Dienste
 Die Koffer-Boxen (SBC4 Linux) erfassen autonom Temperatur- und Feuchtigkeitsdaten, puffern diese lokal und senden sie gebündelt an den zentralen Ingest-Server.
 
