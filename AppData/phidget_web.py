@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+@file: phidget_web.py
+@version: 1.3.0
+@date: 2026-08-29
+@description: Lokale Web-Statusansicht (Port 8081) und optionaler LCD1100-Treiber mit Anbindung an die persistente SQLite-DB.
+@author: Patrick Staehli
+"""
 
 import os
 import time
@@ -11,30 +16,39 @@ from flask import Flask, jsonify, render_template_string
 
 BASE_DIR = "/usr/userapps/PhidgetProject"
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
-RAM_DB_PATH = "/tmp/telemetry.db"
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "telemetry.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [WebGUI] %(message)s")
 logger = logging.getLogger("WebGUI")
 
 app = Flask(__name__)
 
+
 def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Fehler beim Laden von config.yaml: {e}")
+    return {}
+
 
 def get_latest_telemetry():
     telemetry = {}
     pending_count = 0
+    if not os.path.exists(DB_PATH):
+        return telemetry, pending_count
+
     try:
-        conn = sqlite3.connect(RAM_DB_PATH, timeout=2.0)
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # Pufferstand
         cursor.execute("SELECT COUNT(*) AS cnt FROM telemetry_buffer WHERE synced = 0;")
         pending_count = cursor.fetchone()["cnt"]
 
-        # Neueste Werte je Kanal
         cursor.execute("""
             SELECT channel_idx, temperature, timestamp_utc 
             FROM telemetry_buffer 
@@ -51,6 +65,7 @@ def get_latest_telemetry():
         logger.error(f"DB-Abfragefehler im WebGUI: {e}")
 
     return telemetry, pending_count
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -91,7 +106,7 @@ HTML_TEMPLATE = """
     <div class="card">
         <h1>{{ cfg.device.friendly_name }} ({{ cfg.device.device_id }})</h1>
         <p>Phidget Serial: <strong>{{ cfg.device.phidget_serial }}</strong></p>
-        <p>Pufferstand (Unsynced): <span id="pending-count" class="badge badge-pending">{{ pending_count }}</span> Datensätze</p>
+        <p>Pufferstand (Unsynced): <span id="pending-count" class="badge badge-pending">{{ pending_count }}</span> Datensaetze</p>
     </div>
 
     <div class="card">
@@ -137,19 +152,20 @@ def api_live():
         "timestamp_utc": time.time()
     })
 
-# Optionale LCD1100 Integration (falls ein LCD angeschlossen ist)
 def lcd_worker():
     cfg = load_config()
-    serial = cfg["device"]["phidget_serial"]
-    lcd_port = None
+    serial = cfg.get("device", {}).get("phidget_serial")
+    if not serial:
+        return
 
+    lcd_port = None
     for s in cfg.get("sensors", []):
         if s.get("type") == "lcd1100":
             lcd_port = s.get("port", 2)
             break
 
     if lcd_port is None:
-        logger.info("Kein LCD in config.yaml definiert. LCD-Worker übersprungen.")
+        logger.info("Kein LCD in config.yaml definiert. LCD-Worker uebersprungen.")
         return
 
     try:
@@ -164,12 +180,9 @@ def lcd_worker():
         while True:
             telemetry, pending = get_latest_telemetry()
             
-            # Zeile 1
             t0 = telemetry.get(0, {}).get("temp", "--.-")
             t1 = telemetry.get(1, {}).get("temp", "--.-")
             line1 = f"T1:{t0}C T2:{t1}C" if isinstance(t0, float) else "Phidget Ready"
-            
-            # Zeile 2
             line2 = f"Buf: {pending} recs"
             
             lcd.writeText(0, 0, line1[:16].ljust(16))
@@ -178,6 +191,7 @@ def lcd_worker():
             time.sleep(1.0)
     except Exception as e:
         logger.warning(f"LCD-Worker nicht gestartet/unterbrochen: {e}")
+
 
 if __name__ == "__main__":
     t = threading.Thread(target=lcd_worker, daemon=True)

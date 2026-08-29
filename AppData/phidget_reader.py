@@ -1,9 +1,10 @@
 """
 @file: phidget_reader.py
-@version: 1.5.0
-@date: 2026-08-27
+@version: 1.6.0
+@date: 2026-08-29
 @description: 20s-Bucket-Sampling mit 10Hz Oversampling (200 Samples/Block), 
-              Perzentil-Trimming (5%-95%), Median-Filter und EMA-Glättung.
+              Perzentil-Trimming (5%-95%), Median-Filter, EMA-Glaettung und
+              persistenter SQLite-Pufferung auf dem Flash-Speicher.
 @author: Patrick Staehli
 """
 
@@ -21,7 +22,8 @@ from Phidget22.Devices.HumiditySensor import HumiditySensor
 
 BASE_DIR = "/usr/userapps/PhidgetProject"
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
-RAM_DB_PATH = "/tmp/telemetry.db"
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "telemetry.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [10Hz-Reader] %(message)s")
 logger = logging.getLogger("Reader")
@@ -36,16 +38,22 @@ class Phidget10HzReader:
         self._last_values = {}
         self._ema_values = {}  # EMA-Filter Zustand pro Kanal
         
-        self._init_ram_db()
+        self._init_persistent_db()
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
     def _load_config(self):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    return yaml.safe_load(f) or {}
+            except Exception as e:
+                logger.error(f"Fehler beim Laden von config.yaml: {e}")
+        return {}
 
-    def _init_ram_db(self):
-        with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+    def _init_persistent_db(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.execute("""
@@ -60,7 +68,10 @@ class Phidget10HzReader:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_synced_id ON telemetry_buffer(synced, id);")
 
     def setup_hardware(self):
-        serial = self.config["device"]["phidget_serial"]
+        serial = self.config.get("device", {}).get("phidget_serial")
+        if not serial:
+            logger.error("Keine phidget_serial in config.yaml definiert!")
+            return
         
         for s_conf in self.config.get("sensors", []):
             port = s_conf.get("port")
@@ -144,7 +155,7 @@ class Phidget10HzReader:
                     if len(trimmed) == 0:
                         trimmed = arr
 
-                    # 2. Median über die bereinigten Samples
+                    # 2. Median ueber die bereinigten Samples
                     current_val = float(np.median(trimmed))
 
                     # 3. Dynamischer Sprungschutz (max +-3.0 °C pro 20s)
@@ -166,13 +177,13 @@ class Phidget10HzReader:
 
             if db_records:
                 try:
-                    with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+                    with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
                         conn.executemany(
                             "INSERT OR IGNORE INTO telemetry_buffer (timestamp_utc, channel_idx, temperature, synced) VALUES (?, ?, ?, ?)",
                             db_records
                         )
                 except Exception as e:
-                    logger.error(f"Fehler beim Schreiben in RAM-DB: {e}")
+                    logger.error(f"Fehler beim Schreiben in persistente SQLite-DB: {e}")
 
     def shutdown(self, signum, frame):
         logger.info("Schliesse Phidget-Hardware...")

@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 @file: sync_worker.py
-@version: 1.4.2
-@date: 2026-08-27
-@description: Finaler Sync-Worker mit korrekten job_ids (temp0-temp3) für das Dashboard.
-@author: Patrick Stähli
+@version: 1.5.0
+@date: 2026-08-29
+@description: Sync-Worker fuer persistente SQLite-Pufferung mit Dashboard-konformen job_ids (temp0-temp7, ambient, humidity) und atomarem Chunk-Delete.
+@author: Patrick Staehli
 """
 
 import os
@@ -19,21 +16,34 @@ from datetime import datetime, timezone
 
 BASE_DIR = "/usr/userapps/PhidgetProject"
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
-RAM_DB_PATH = "/tmp/telemetry.db"
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "telemetry.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [SyncWorker] %(message)s")
 logger = logging.getLogger("SyncWorker")
 
+
 def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Fehler beim Laden von config.yaml: {e}")
+    return {}
+
 
 def sync_loop():
     cfg = load_config()
-    device_id = cfg["device"]["device_id"]
-    ingest_url = cfg["server"]["ingest_url"]
-    token = cfg["server"]["api_token"]
+    device_id = cfg.get("device", {}).get("device_id")
+    ingest_url = cfg.get("server", {}).get("ingest_url")
+    token = cfg.get("server", {}).get("api_token")
     
+    if not device_id or not ingest_url or not token:
+        logger.error("Fehlende Konfiguration (device_id, ingest_url oder api_token) in config.yaml!")
+        time.sleep(5.0)
+        return
+
     BATCH_SIZE = 200
 
     headers = {
@@ -41,15 +51,19 @@ def sync_loop():
         "Content-Type": "application/json"
     }
 
-    logger.info(f"SyncWorker gestartet für Device: {device_id} -> {ingest_url}")
+    logger.info(f"SyncWorker gestartet fuer Device: {device_id} -> {ingest_url}")
 
     while True:
+        if not os.path.exists(DB_PATH):
+            time.sleep(1.0)
+            continue
+
         rows = []
         pending_count = 0
         max_id = None
 
         try:
-            with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+            with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
 
@@ -67,7 +81,7 @@ def sync_loop():
                 if rows:
                     max_id = rows[-1]["id"]
         except Exception as e:
-            logger.error(f"Fehler beim Lesen der RAM-DB: {e}")
+            logger.error(f"Fehler beim Lesen der persistenten SQLite-DB: {e}")
             time.sleep(2.0)
             continue
 
@@ -80,7 +94,6 @@ def sync_loop():
             dt_iso = datetime.fromtimestamp(r["timestamp_utc"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             ch_idx = int(r["channel_idx"])
             
-            # WICHTIG: Dashboard erwartet temp0-temp3 für die Anzeige!
             if ch_idx < 100:
                 job_id = f"temp{ch_idx}"
             elif ch_idx == 100:
@@ -92,7 +105,7 @@ def sync_loop():
                 "timestamp": dt_iso,
                 "channel": ch_idx,
                 "temperature": float(r["temperature"]),
-                "job_id": f"temp{ch_idx}" if ch_idx < 100 else ("ambient" if ch_idx == 100 else "humidity")
+                "job_id": job_id
             })
 
         payload = {
@@ -107,7 +120,7 @@ def sync_loop():
             res = requests.post(ingest_url, json=payload, headers=batch_headers, timeout=5.0)
 
             if res.status_code == 200:
-                with sqlite3.connect(RAM_DB_PATH, timeout=5.0) as conn:
+                with sqlite3.connect(DB_PATH, timeout=10.0) as conn:
                     conn.execute("DELETE FROM telemetry_buffer WHERE id <= ?;", (max_id,))
                     conn.commit()
                 
@@ -127,6 +140,7 @@ def sync_loop():
             time.sleep(3.0)
 
         time.sleep(1.0)
+
 
 if __name__ == "__main__":
     sync_loop()
