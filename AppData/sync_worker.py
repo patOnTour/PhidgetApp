@@ -1,8 +1,8 @@
 """
 @file: sync_worker.py
-@version: 1.6.0
+@version: 1.6.1
 @date: 2026-08-29
-@description: Sync-Worker fuer persistente SQLite-Pufferung mit Dashboard-konformen job_ids (temp0-temp7, ambient, humidity), atomarem Chunk-Delete und X-Client-Version Header.
+@description: Sync-Worker mit dynamischer Git-Tag-Versionserkennung, SQLite-Pufferung und atomarem Chunk-Delete.
 @author: Patrick Staehli
 """
 
@@ -12,9 +12,8 @@ import yaml
 import sqlite3
 import logging
 import requests
+import subprocess
 from datetime import datetime, timezone
-
-CLIENT_VERSION = "v1.6.0"
 
 BASE_DIR = "/usr/userapps/PhidgetProject"
 CONFIG_PATH = os.path.join(BASE_DIR, "config", "config.yaml")
@@ -23,6 +22,25 @@ DB_PATH = os.path.join(DATA_DIR, "telemetry.db")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [SyncWorker] %(message)s")
 logger = logging.getLogger("SyncWorker")
+
+
+def get_git_version():
+    """Liest den aktuellen Git-Tag oder Short-Commit aus dem Projektordner."""
+    try:
+        tag = subprocess.check_output(
+            ["git", "describe", "--tags", "--always"],
+            cwd=BASE_DIR,
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        if tag:
+            return tag
+    except Exception:
+        pass
+    return "v1.6.1"
+
+
+CLIENT_VERSION = get_git_version()
 
 
 def load_config():
@@ -36,6 +54,7 @@ def load_config():
 
 
 def sync_loop():
+    global CLIENT_VERSION
     cfg = load_config()
     device_id = cfg.get("device", {}).get("device_id")
     ingest_url = cfg.get("server", {}).get("ingest_url")
