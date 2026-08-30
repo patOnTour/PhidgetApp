@@ -1,8 +1,8 @@
 """
 @file: phidget_netmon.py
-@version: 1.3.0
-@date: 2026-08-29
-@description: Netzwerk-Monitor mit echter Uptime-Pruefung gegen Ghost-Boot-Notifications und Notfall-Hotspot-Verwaltung.
+@version: 1.4.0
+@date: 2026-08-30
+@description: Netzwerk-Monitor mit ganzheitlichem Interface-Reset, Notfall-Hotspot und automatischem Hard-Reboot-Fallback.
 @author: Patrick Staehli
 """
 
@@ -103,15 +103,23 @@ def send_ntfy_boot():
         logger.warning(f"ntfy-Bootbenachrichtigung fehlgeschlagen: {e}")
 
 
-def reset_wifi_interface():
-    logger.warning("WLAN-Verbindung unterbrochen! Starte NetworkManager/wpa_supplicant neu...")
+def reset_network_interfaces():
+    logger.warning("Netzwerkverbindung unterbrochen! Fuehre vollstaendigen Interface- und DHCP-Reset aus...")
     try:
+        # Networking / wpa_supplicant neustarten
+        subprocess.run(["systemctl", "restart", "networking"], check=False)
         subprocess.run(["systemctl", "restart", "wpa_supplicant"], check=False)
+        
+        # WLAN Reset
         subprocess.run(["ifconfig", "wlan0", "down"], check=False)
-        time.sleep(2)
+        time.sleep(1)
         subprocess.run(["ifconfig", "wlan0", "up"], check=False)
+
+        # DHCP Client erneuern
+        subprocess.run(["dhclient", "-r"], check=False)
+        subprocess.run(["dhclient", "-v"], check=False)
     except Exception as e:
-        logger.error(f"Fehler beim WLAN-Reset: {e}")
+        logger.error(f"Fehler beim Netzwerk-Reset: {e}")
 
 
 def netmon_loop():
@@ -119,6 +127,7 @@ def netmon_loop():
     ping_target = cfg.get("network", {}).get("ping_target", "1.1.1.1")
     check_interval = cfg.get("network", {}).get("check_interval_sec", 15)
     fallback_min = cfg.get("network", {}).get("hotspot_fallback_min", 5)
+    auto_reboot_min = cfg.get("network", {}).get("auto_reboot_min", 10)
 
     send_ntfy_boot()
 
@@ -142,13 +151,22 @@ def netmon_loop():
             offline_seconds += check_interval
             logger.warning(f"Ping fehlgeschlagen. Offline seit {offline_seconds}s")
 
+            # Stufe 1: Sanfter Netzwerk-Reset nach 45 Sekunden
             if offline_seconds == 45:
-                reset_wifi_interface()
+                reset_network_interfaces()
 
+            # Stufe 2: Notfall-Hotspot aktivieren nach konfigurierter Wartezeit (Standard: 5 Min)
             if offline_seconds >= (fallback_min * 60) and not hotspot_active:
                 logger.error(f"Seit {fallback_min} Min offline. Starte Notfall-Hotspot (hostapd)...")
                 subprocess.run(["systemctl", "start", "hostapd"], check=False)
                 hotspot_active = True
+
+            # Stufe 3: Automatische Notbremse (Reboot) nach konfigurierter Zeit (Standard: 10 Min)
+            if offline_seconds >= (auto_reboot_min * 60):
+                logger.critical(f"Kritisch: Box seit {auto_reboot_min} Min offline. Loese System-Reboot aus!")
+                subprocess.run(["sync"], check=False)
+                subprocess.run(["reboot"], check=False)
+                time.sleep(30)
 
         time.sleep(check_interval)
 
